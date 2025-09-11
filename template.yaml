@@ -1,0 +1,53 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Maleicultura - FastAPI on Lambda + HTTP API
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 10
+    MemorySize: 256
+    Architectures: [x86_64]
+    Environment:
+      Variables:
+        GRAPH_API_VERSION: v20.0
+        WHATSAPP_VERIFY_TOKEN: '{{resolve:ssm:/maleicultura/whatsapp_verify_token:1}}'
+        WHATSAPP_TOKEN_PARAM: /maleicultura/whatsapp_token
+        WHATSAPP_PHONE_NUMBER_ID: '{{resolve:ssm:/maleicultura/phone_number_id:1}}'
+
+Resources:
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/maleicultura/*
+      Events:
+        Root:
+          Type: HttpApi
+          Properties:
+            Path: /
+            Method: GET
+        WebhookGet:
+          Type: HttpApi
+          Properties:
+            Path: /webhook
+            Method: GET
+        WebhookPost:
+          Type: HttpApi
+          Properties:
+            Path: /webhook
+            Method: POST
+
+Outputs:
+  ApiEndpoint:
+    Description: Endpoint HTTP público
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
