@@ -1,6 +1,6 @@
 import os
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, Response
 from mangum import Mangum
 
@@ -74,9 +74,52 @@ async def incoming(request: Request):
             return {"status": "ok"}
 
         print({"type":"wa_inbound_message", "from": wa_from, "msg_type": wa_type})
+        
+        #=============================================================================
+        #               Handlers a serem usados para integrar as APIs
+        #=============================================================================
+        #   Métodos, imports ou quaisquer implementações devem ser feitas apenas dentro do handler designado.
+        #   Se precisarem de qualquer ajuda com relação a tokens ou variáveis de ambiente (provavelmente vão dar problema por causa do AWS), me mandem mensagem que eu descubro o problema.
+        #   No README.md eu detalho melhor como fazer o deploy, é fácil, mas o ideal é fazer os comandos pelo Linux (ou wsl), na verdade eu não tenho ideia de como funciona direto no Windows.
+        
+        # prefixo: @
+        async def dev_handler1(user_text:str, wa_from: str, C: dict) -> str:
+            #TODO: Integrar LLM (Fabricio)
+            return f"{user_text}"
+    
+        # prefixo: $
+        async def dev_handler2(user_text:str, wa_from: str, C: dict) -> str:
+            #TODO: Integrar LLM (Bruno)
+            return f"{user_text}"
+    
+        # prefixo: &
+        async def dev_handler3(user_text:str, wa_from: str, C: dict) -> str:
+            #TODO: Integrar LLM (Nathaniel)
+            return f"{user_text}"
+        
+        text = (msg.get("text") or {}).get("body", "").strip()
+        if not text:
+            text = ""
 
+        prefix = text[:1]
+        user_text = text[1:].lstrip() if len(text) > 1 else ""
+        match prefix:
+            case "@":
+                reply_text = await dev_handler1(user_text=user_text, wa_from=wa_from, C=C)
+            case "$":
+                reply_text = await dev_handler2(user_text=user_text, wa_from=wa_from, C=C)
+            case "&":
+                reply_text = await dev_handler3(user_text=user_text, wa_from=wa_from, C=C)
+            case _:
+                reply_text = {
+                    "Prefixo de mensagem não definido, por favor use:\n"
+                    "@ [texto] -> Fabricio\n"
+                    "$ [texto] -> Bruno\n"
+                    "& [texto] -> Nathaniel\n"
+                }
+         
         if C["DRY_RUN"]:
-            print({"type":"wa_outbound_dry_run", "to": wa_from, "text": "oi"})
+            print({"type":"wa_outbound_dry_run", "to": wa_from, "text": reply_text[:2000]}) # 2000 é o tamanho default de resposta, mas podem aumentar se for necessário
             return {"status": "dry_ok"}
 
         url = f"https://graph.facebook.com/{C['GRAPH_VERSION']}/{C['PHONE_NUMBER_ID']}/messages"
@@ -84,7 +127,7 @@ async def incoming(request: Request):
             "messaging_product": "whatsapp",
             "to": wa_from,
             "type": "text",
-            "text": {"body": "oi"},
+            "text": {"body": reply_text},
         }
         token = (C["WABA_TOKEN"] or "")
         token = token.replace("\r", "").replace("\n", "").strip().strip('"').strip("'")
