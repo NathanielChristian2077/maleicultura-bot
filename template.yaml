@@ -11,9 +11,9 @@ Globals:
     Environment:
       Variables:
         GRAPH_API_VERSION: v20.0
-        WHATSAPP_VERIFY_TOKEN: '{{resolve:ssm:/maleicultura/whatsapp_verify_token:1}}'
-        WHATSAPP_TOKEN_PARAM: /maleicultura/whatsapp_token
-        WHATSAPP_PHONE_NUMBER_ID: '{{resolve:ssm:/maleicultura/phone_number_id:1}}'
+        WHATSAPP_VERIFY_TOKEN: '{{resolve:ssm:/maleicultura/whatsapp_verify_token}}'
+        WHATSAPP_TOKEN: '{{resolve:ssm:/maleicultura/whatsapp_token}}'
+        WHATSAPP_PHONE_NUMBER_ID: '{{resolve:ssm:/maleicultura/phone_number_id}}'
 
 Resources:
   ApiFunction:
@@ -23,29 +23,12 @@ Resources:
       Handler: app.handler
       Policies:
         - AWSLambdaBasicExecutionRole
-        - Statement:
-            - Effect: Allow
-              Action:
-                - ssm:GetParameter
-                - ssm:GetParameters
-              Resource:
-                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/maleicultura/*
       Events:
-        Root:
+        Proxy:
           Type: HttpApi
           Properties:
-            Path: /
-            Method: GET
-        WebhookGet:
-          Type: HttpApi
-          Properties:
-            Path: /webhook
-            Method: GET
-        WebhookPost:
-          Type: HttpApi
-          Properties:
-            Path: /webhook
-            Method: POST
+            Path: /{proxy+}
+            Method: ANY
 
 Outputs:
   ApiEndpoint:

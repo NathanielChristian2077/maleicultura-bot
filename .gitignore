@@ -1,0 +1,14 @@
+# AWS / SAM
+.aws/
+*.zip
+*.aws-sam/
+samconfig.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+src/__pycache__/
+
+.vscode/
