@@ -4,7 +4,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, Response
 from mangum import Mangum
 
+import boto3
+from botocore.config import Config
+
 app = FastAPI()
+_lambda = boto3.client("lambda", config=Config(retries={"max_attempts": 2}))
 
 def env(name: str, default: str = "") -> str:
     fallback_map = {
@@ -95,7 +99,28 @@ async def incoming(request: Request):
         # prefixo: &
         async def dev_handler3(user_text:str, wa_from: str, C: dict) -> str:
             #TODO: Integrar LLM (Nathaniel)
-            return f"{user_text}"
+            import openai
+            from langchain import memorys
+            from langchain.chains import ConversationChain
+            # Apenas para teste, a API oficial será usada posteriormente para produção
+            client = openai.OpenAI(
+                base_url="https://api.llm7.io/v1/chat/completions",
+                api_key="V9aON2wRd+sr0kjbRRp+ZsxIEkZ0VIs4rFUcuWg+YqCtgaMFQ4UFExXFdPTn/Jxj4+BWxjWurv3I9mxWflu7430gGIFfhVnUYvD2hFKPNEbf/ZKj8Ujqw68soVakuAP4ImZdz6ZPww==",
+                http_client=httpx.Client(verify=False)
+            )
+            response = client.chat.completions.create(
+                model="deepseek-v3.1",
+                messages=[
+                    {"role": "system", "content": "Você é um assistente de maleicultores brasileiros extremamente prestativo e objetivo que fala apenas em português."},
+                    {"role": "user", "content": user_text}
+                ],
+                temperature=0.3,
+                # 300 tokens = +/- 300/0.3 = 1000 palavras, na prática seria um pouco mais, mas considerando apenas testes...
+                max_tokens=300, # Ajustar para 500 {500/0.27 = 1851 palavras} em produção.
+                max_retries=2,
+                request_timeout=15
+            )
+            return response.choices[0].message.content.strip()
         
         text = (msg.get("text") or {}).get("body", "").strip()
         if not text:
@@ -111,15 +136,15 @@ async def incoming(request: Request):
             case "&":
                 reply_text = await dev_handler3(user_text=user_text, wa_from=wa_from, C=C)
             case _:
-                reply_text = {
+                reply_text = (
                     "Prefixo de mensagem não definido, por favor use:\n"
                     "@ [texto] -> Fabricio\n"
                     "$ [texto] -> Bruno\n"
                     "& [texto] -> Nathaniel\n"
-                }
+                )
          
         if C["DRY_RUN"]:
-            print({"type":"wa_outbound_dry_run", "to": wa_from, "text": reply_text[:2000]}) # 2000 é o tamanho default de resposta, mas podem aumentar se for necessário
+            print({"type":"wa_outbound_dry_run", "to": wa_from, "text": reply_text[:4096]})
             return {"status": "dry_ok"}
 
         url = f"https://graph.facebook.com/{C['GRAPH_VERSION']}/{C['PHONE_NUMBER_ID']}/messages"
@@ -127,7 +152,7 @@ async def incoming(request: Request):
             "messaging_product": "whatsapp",
             "to": wa_from,
             "type": "text",
-            "text": {"body": reply_text},
+            "text": {"body": str(reply_text)[:4096]}, # o limite do whatsapp é 4096
         }
         token = (C["WABA_TOKEN"] or "")
         token = token.replace("\r", "").replace("\n", "").strip().strip('"').strip("'")
@@ -141,7 +166,7 @@ async def incoming(request: Request):
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(url, json=payload, headers=headers)
 
-        txt = resp.text[:2000]
+        txt = resp.text[:4000] # o limite do whatsapp é 4096
         print({"type":"wa_outbound_resp", "status": resp.status_code, "body": txt})
 
         if resp.is_success:
