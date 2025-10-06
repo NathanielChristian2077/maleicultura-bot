@@ -17,7 +17,6 @@ def env(name: str, default: str = "") -> str:
         "WHATSAPP_PHONE_NUMBER_ID": ["PHONE_NUMBER_ID"],
         "GRAPH_API_VERSION": ["GRAPH_VERSION"],
         "DRY_RUN": [],
-        "GEMINI_API_KEY": [""]
     }
     val = os.getenv(name)
     if val is None:
