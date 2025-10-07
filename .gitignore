@@ -8,7 +8,7 @@ samconfig.toml
 __pycache__/
 *.pyc
 .venv/
+venv/
 .env
-src/__pycache__/
 
 .vscode/
