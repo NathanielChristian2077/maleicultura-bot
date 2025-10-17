@@ -33,6 +33,21 @@ Resources:
           Properties:
             Path: /{proxy+}
             Method: ANY
+  ConversationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: conversations
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: wa_from
+          AttributeType: S
+        - AttributeName: ts
+          AttributeType: N
+      KeySchema:
+        - AttributeName: wa_from        
+          KeyType: HASH
+        - AttributeName: ts        
+          KeyType: RANGE
 
 Outputs:
   ApiEndpoint:
