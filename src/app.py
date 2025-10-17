@@ -214,26 +214,95 @@ async def incoming(request: Request):
     
         # prefixo: &
         async def dev_handler3(user_text:str, wa_from: str) -> str:
-            import openai
+            from langchain_openai import ChatOpenAI
+            from langcahin.schema import SystemMessage, HumanMessage, AIMessage
+            from botocore.exceptions import ClientError
 
-            client = openai.OpenAI(
-                api_key=os.environ.get('DEEPSEEK_API_KEY'),
-                base_url="https://api.deepseek.com"
-            )
+            TABLE = os.getenv("CONV_TABLE", "conversations")
+            ddb = boto3.client("dynamoDB")
+
+            def _ts_ms() -> int:
+                return int(time.time() * 1000)
             
-            response = await asyncio.to_thread(
-                lambda: client.chat.completions.create(
-                    model="deepseek-chat",
-                    messages=[
-                        {"role": "system", "content": "Você é um assistente de maleicultores brasileiros extremamente prestativo e objetivo que fala apenas em português."},
-                        {"role": "user", "content": user_text}
-                    ],
-                    temperature=0.3,
-                    # 300 tokens = +/- 300/0.3 = 1000 caracteres, na prática seria um pouco mais, mas considerando apenas testes...
-                    max_tokens=300, # Ajustar para 500 {500/0.27 = 1851 caracteres} em produção.
-                )
+            # Salva a mensagem, ts(time stamp), role e o número(wa_from -> PHONE_NUMBER_ID) do usuário
+            def save_message(role: str, body: str) -> None:
+                try:
+                    ddb.put_item(
+                        TableName = TABLE,
+                        Item = {
+                            "wa_from": {"S": wa_from},
+                            "ts": {"N": str(_ts_ms())},
+                            "role": {"S": role},
+                            "content": {"S": body or ""},
+                        },
+                    )
+                except ClientError  as e:
+                    print({"type": "ddb_put_err", "error": str(e)})
+            
+            # Retorna apenas as mensagens do usuário de id = :w
+            # Isso é feito sem intervenção do llm, direcionando o foco do mesmo apenas para o conteúdo das mensagens
+            # Esse trabalho fica pra mais uma das funcionalidades do aws, esse é o DynamoDB, trata-se de um NoSQL
+            def fetch_last(limit: int = 10):
+                try:
+                    resp = ddb.query(
+                        TableName = TABLE,
+                        KeyConditionExpression = "wa_from = :w",
+                        ExpressionAttributeValues = {":w": {"S": wa_from}},
+                        Limit = limit,
+                        ScanIndexForward = False, # -> da mais recente pra mais antiga
+                    )
+
+                    items = resp.get("Items", [])
+                    # e aqui retorna em ordem cronológica
+                    items = list(reversed(items))
+                    out = []
+                    
+                    for it in items:
+                        out.append({
+                            "role": it["role"]["S"],
+                            "body": it["body"]["S"],
+                        })
+
+                    return out
+                except ClientError as e:
+                    print({"type": "ddb_query_err", "error": str(e)})
+                    return []
+            
+            save_message("user", user_text) # do usuário
+
+            history = fetch_last() # Carrega as últimas 10 mensagens(ajustável)
+                                   # Tenha em mente que nessas 10 mensagens estão incluídas as mensagens do LLM, IDEALMENTE serão 50/50 entre user e assistant 
+            
+            # montagem do request. Mudou um pouco por causa do langchain, mas a ideia ainda é a mesma
+            msgs = [SystemMessage(content="Você é um assistente de produtores de maçã brasileiros extremamente prestativo e objetivo que fala apenas em português.")]
+
+            for reg in history:
+                r = reg.get("role", "").lower()
+                b = reg.get("body", "")
+                if r == "user":
+                    msgs.append(HumanMessage(content=b))
+                elif r == "assistant":
+                    msgs.append(AIMessage(content=b))
+            if not msgs or not isinstance(msgs[-1], HumanMessage):
+                msgs.append(HumanMessage(content=user_text))
+
+            client = ChatOpenAI(
+                api_key=os.environ.get('DEEPSEEK_API_KEY'),
+                base_url="https://api.deepseek.com",
+                model="deepseek-chat",
+                temperature=0.3,
+                max_tokens=300 # 300 tokens = +/- 300/0.3 = 1000 caracteres, na prática seria um pouco mais, mas considerando apenas testes...
             )
-            return response.choices[0].message.content.strip()
+            try:
+                response = await asyncio.to_thread(client.invoke, msgs)
+                send = (getattr(response, "body", None) or str(response)).strip()
+            except Exception as e:
+                print({"type": "deepseek_exception", "error": str(e)})
+                send = None # Aqui poderia ser a mensagem de fallback pedindo uma nova tentativa, mas como isso ainda é um teste individual, mantive ela no 'reply_text'
+            # Salvando a mensagem do próprio llm, relembrando que ela será uma das 10 mensagens salvas no fetch_class()
+            save_message("assistant", send)
+
+            return send
         
         text = (msg.get("text") or {}).get("body", "").strip()
         if not text:
