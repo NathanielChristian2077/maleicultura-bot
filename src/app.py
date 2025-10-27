@@ -214,7 +214,7 @@ async def incoming(request: Request):
                 google_api_key=env("GEMINI_API_KEY"),
                 convert_system_message_to_human=True,
                 temperature=0.3,
-                max_output_tokens=300,
+                max_output_tokens=500,
             )
             prompt = (
                 "Resuma o diálogo a seguir de forma breve, mantendo informações importantes e contexto:\n\n"
@@ -247,6 +247,8 @@ async def incoming(request: Request):
                 model="gemini-2.5-flash",
                 google_api_key=env("GEMINI_API_KEY"),
                 convert_system_message_to_human=True,
+                temperature=0.3,
+                max_output_tokens=300,
             )
 
             history = fetch_messages(30)

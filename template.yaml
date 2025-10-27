@@ -30,6 +30,17 @@ Resources:
       Handler: app.handler
       Policies:
         - AWSLambdaBasicExecutionRole
+        - Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:Query
+              - dynamodb:DescribeTable
+              - dynamodb:DeleteItem
+              - dynamodb:Scan
+              - dynamodb:UpdateItem
+            Resource:
+              - !GetAtt ConversationsTable.Arn
       Events:
         Proxy:
           Type: HttpApi
