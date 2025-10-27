@@ -13,17 +13,13 @@ import time
 app = FastAPI()
 _lambda = boto3.client("lambda", config=Config(retries={"max_attempts": 2}))
 
-# Parece que ainda existem situações onde acontece de uma mensagem receber mais de uma resposta do llm, mais frequente com o gemini (não consegui pensar num motivo) 
-_seen_wamids: dict[str, float] = {} 
+_seen_wamids: dict[str, float] = {}
 _DEDUP_TTL_SEC = 600
+
 
 def seen_bfr(wamid: str):
     now = time.time()
-    expired = [
-        k for k, ts in _seen_wamids.items() 
-            if now - ts > _DEDUP_TTL_SEC
-    ]
-
+    expired = [k for k, ts in _seen_wamids.items() if now - ts > _DEDUP_TTL_SEC]
     for k in expired:
         _seen_wamids.pop(k, None)
     if not wamid:
@@ -32,6 +28,7 @@ def seen_bfr(wamid: str):
         return True
     _seen_wamids[wamid] = now
     return False
+
 
 def env(name: str, default: str = "") -> str:
     fallback_map = {
@@ -49,6 +46,7 @@ def env(name: str, default: str = "") -> str:
                 break
     return val if val is not None else default
 
+
 def cfg():
     raw = env("WHATSAPP_TOKEN")
     clean = (raw or "").replace("\r", "").replace("\n", "").strip().strip('"').strip("'")
@@ -60,18 +58,17 @@ def cfg():
         "DRY_RUN": env("DRY_RUN", "false").lower() == "true",
     }
 
+
 @app.get("/webhook")
 async def verify(request: Request):
     C = cfg()
     qp = request.query_params
-
     mode = qp.get("hub.mode") or qp.get("mode")
     verify_token = qp.get("hub.verify_token") or qp.get("verify_token")
     challenge = qp.get("hub.challenge") or qp.get("challenge")
 
     if mode == "subscribe" and verify_token == C["VERIFY_TOKEN"] and challenge:
         return PlainTextResponse(challenge)
-
     return Response(status_code=403)
 
 @app.post("/webhook")
@@ -80,13 +77,12 @@ async def incoming(request: Request):
     try:
         raw = await request.body()
         print({"type": "wa_inbound_raw", "len": len(raw)})
-
         body = await request.json()
         print({"type": "wa_inbound_parsed", "keys": list(body.keys())})
 
         entry = (body.get("entry") or [{}])[0]
         change = (entry.get("changes") or [{}])[0]
-        value  = change.get("value") or {}
+        value = change.get("value") or {}
 
         if not value.get("messages"):
             print({"type": "wa_inbound_skip", "reason": "no_messages_key"})
@@ -97,18 +93,18 @@ async def incoming(request: Request):
         wa_from = msg.get("from")
         is_echo = msg.get("from") == (value.get("metadata") or {}).get("display_phone_number")
         if is_echo:
-            print({"type":"wa_inbound_skip", "reason":"echo"})
+            print({"type": "wa_inbound_skip", "reason": "echo"})
             return {"status": "ok"}
-        
+
         wamid = msg.get("id") or msg.get("wamid")
         if seen_bfr(wamid):
-            print({"type":"wa_inbound_skip", "reason":"duplicate_wamid", "wamid": wamid})
-            return {"status":"ok"}
+            print({"type": "wa_inbound_skip", "reason": "duplicate_wamid", "wamid": wamid})
+            return {"status": "ok"}
 
-        print({"type":"wa_inbound_message", "from": wa_from, "msg_type": wa_type})
+        print({"type": "wa_inbound_message", "from": wa_from, "msg_type": wa_type})
 
-        url = f"https://graph.facebook.com/{C['GRAPH_VERSION']}/{C['PHONE_NUMBER_ID']}/message"
-        
+        wa_api_url = f"https://graph.facebook.com/{C['GRAPH_VERSION']}/{C['PHONE_NUMBER_ID']}/messages"
+
         token = (C["WABA_TOKEN"] or "")
         token = token.replace("\r", "").replace("\n", "").strip().strip('"').strip("'")
 
@@ -118,205 +114,279 @@ async def incoming(request: Request):
             "Accept": "application/json",
         }
 
-        # Feedback imediato pro usuário
+        # Feedback visual: read e typing
         try:
-            async with httpx.AsyncClient(timeout = 10) as cliente_fb:
-                # Marca mensagem como lida
-                await cliente_fb.post(
-                    url,
-                    headers,
-                    json = {
+            async with httpx.AsyncClient(timeout=10) as fb:
+                await fb.post(
+                    wa_api_url,
+                    headers=headers,
+                    json={
                         "messaging_product": "whatsapp",
                         "status": "read",
                         "message_id": wamid,
                     },
                 )
-
-                # Faz a animação de typing na conversa e define o contato como typing na visualização das conversas
-                await cliente_fb.post(
-                    url,
-                    headers,
-                    json = {
-                       "messaging_product": "whatsapp",
-                       "to": wa_from,
-                       "type": "typing",
-                       "typing": {"status": "typing"}, 
+                await fb.post(
+                    wa_api_url,
+                    headers=headers,
+                    json={
+                        "messaging_product": "whatsapp",
+                        "to": wa_from,
+                        "type": "typing",
+                        "typing": {"status": "typing"},
                     },
                 )
         except Exception as e:
             print({"type": "wa_feedback_err", "error": str(e)})
 
-        #=============================================================================
-        #               Handlers a serem usados para integrar as APIs
-        #=============================================================================
-        #   Métodos, imports ou quaisquer implementações devem ser feitas apenas dentro do handler designado.
-        #   Se precisarem de qualquer ajuda com relação a tokens ou variáveis de ambiente (provavelmente vão dar problema por causa do AWS), me mandem mensagem que eu descubro o problema.
-        #   No README.md eu detalho melhor como fazer o deploy, é fácil, mas o ideal é fazer os comandos pelo Linux (ou wsl), na verdade eu não tenho ideia de como funciona direto no Windows.
+        # ===========================================
+        #  MEMÓRIA DynamoDB e Resumo (Gemini)
+        # ===========================================
+        # Direcionei todos os resumos pro Gemini (já que não tem custo), por enquanto é apenas para testes
+        from botocore.exceptions import ClientError
+
+        CONV_TABLE = os.getenv("CONV_TABLE", "conversations")
+        CONV_TOKEN_LIMIT = int(os.getenv("CONV_TOKEN_LIMIT", "2000"))
+        CONV_TTL_DAYS = int(os.getenv("CONV_TTL_DAYS", "7")) # A cada 7 dias a conversa é apagada dos registros
+        ddb = boto3.client("dynamodb")
         
-        # prefixo: @
-        async def dev_handler1(user_text:str, wa_from: str) -> str:
+        def _ttl_epoch_seconds(days: int) -> int:
+           return int(time.time()) + days * 86400 # Dynamo precisa dos dias em segundos 
+
+        def _ts_ms():
+            return int(time.time() * 1000)
+
+        def _approx_tokens(text: str):
+            if not text:
+                return 0
+            return max(1, int(len(text.split()) / 0.75))
+
+        def save_message(role: str, content: str):
+            try:
+                ddb.put_item(
+                    TableName=CONV_TABLE,
+                    Item={
+                        "wa_from": {"S": wa_from},
+                        "ts": {"N": str(_ts_ms())},
+                        "role": {"S": role},
+                        "content": {"S": content or ""},
+                        "ttl": {"N": str(_ttl_epoch_seconds(CONV_TTL_DAYS))},  # TTL em segundos
+                    },
+                )
+            except ClientError as e:
+                print({"type": "ddb_put_err", "error": str(e)})
+
+        def fetch_messages(limit: int = 50):
+            try:
+                resp = ddb.query(
+                    TableName=CONV_TABLE,
+                    KeyConditionExpression="wa_from = :w",
+                    ExpressionAttributeValues={":w": {"S": wa_from}},
+                    Limit=limit,
+                    ScanIndexForward=False,
+                )
+                items = list(reversed(resp.get("Items", [])))
+                return [
+                    {
+                        "ts": int(it["ts"]["N"]),
+                        "role": it["role"]["S"],
+                        "content": it["content"]["S"],
+                    }
+                    for it in items
+                ]
+            except ClientError as e:
+                print({"type": "ddb_query_err", "error": str(e)})
+                return []
+
+        async def maybe_summarize_with_gemini():
+            history = fetch_messages(100)
+            joined = "\n".join(f"{r['role']}: {r['content']}" for r in history)
+            total = _approx_tokens(joined)
+            if total <= CONV_TOKEN_LIMIT:
+                return
+
+            print({"type": "token_limit_hit", "tokens": total})
             from langchain_google_genai import ChatGoogleGenerativeAI
-            from langchain.prompts import ChatPromptTemplate
+            from langchain.schema import HumanMessage
 
             llm = ChatGoogleGenerativeAI(
-                model= 'gemini-2.5-flash',
-                google_api_key= env("GEMINI_API_KEY"),
-                convert_system_message_to_human=True
+                model="gemini-2.5-flash",
+                google_api_key=env("GEMINI_API_KEY"),
+                convert_system_message_to_human=True,
+                temperature=0.3,
+                max_output_tokens=300,
+            )
+            prompt = (
+                "Resuma o diálogo a seguir de forma breve, mantendo informações importantes e contexto:\n\n"
+                + joined
+            )
+            try:
+                res = await asyncio.to_thread(llm.invoke, [HumanMessage(content=prompt)])
+                summary = getattr(res, "content", "") or str(res)
+                if summary:
+                    save_message("system_summary", summary.strip()[:2000])
+                    print({"type": "summary_created", "len": len(summary)})
+            except Exception as e:
+                print({"type": "summary_exception", "error": str(e)})
+
+        def latest_summary():
+            for rec in reversed(fetch_messages(100)):
+                if rec["role"] == "system_summary":
+                    return rec["content"]
+            return None
+
+        # ===========================================
+        #               HANDLERS
+        # ===========================================
+        # prefixo: @ (Gemini)
+        async def dev_handler1(user_text: str, wa_from: str) -> str:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            from langchain.schema import SystemMessage, HumanMessage, AIMessage
+
+            llm = ChatGoogleGenerativeAI(
+                model="gemini-2.5-flash",
+                google_api_key=env("GEMINI_API_KEY"),
+                convert_system_message_to_human=True,
             )
 
-            prompt = ChatPromptTemplate.from_messages([
-                ("system","""
-                        Você é um consultor agrícola especializado em pomares de maçã, com foco em ajudar produtores rurais.
-                        Sua missão é explicar de forma simples, prática e acessível, evitando termos muito técnicos ou acadêmicos.
+            history = fetch_messages(30)
+            summary = latest_summary()
 
-                        Sempre que possível:
-                        - Dê exemplos reais de manejo.
-                        - Sugira passos práticos que o produtor possa aplicar no dia a dia.
-                        - Traga dicas sobre plantio, poda, irrigação, adubação, pragas, colheita e venda de maçãs.
-                        - Use uma linguagem de conversa amigável, como se estivesse no campo com o produtor.
-
-                        Se o usuário fizer perguntas fora da maleicultura, responda de forma breve e procure trazer o foco de volta para a cultura da maçã.
-                        O tom deve ser acolhedor e confiante, mostrando experiência, mas sem parecer complicado demais.
-                    """),
-                ("user", "{user}")
-            ])
-
-            chain = prompt | llm
-
-            response = await asyncio.to_thread(chain.invoke, {"user":user_text})
+            msgs = [
+                SystemMessage(
+                    content=
+                    """
+                    Você é um consultor agrícola especializado em produção e manejo de maçãs.
+                    Seu papel é orientar produtores sobre plantio, irrigação, poda, controle de pragas, colheita e comercialização.
+                    Responda de forma clara, prática e técnica, com foco em aumentar a produtividade e a qualidade das maçãs, reduzindo custos e impactos ambientais.
+                    Dê dicas objetivas baseadas em boas práticas agrícolas e experiências reais no campo.
+                    """.strip()
+                )
+            ]
+            if summary:
+                msgs.append(SystemMessage(content=f"Resumo: {summary}"))
+            for rec in [r for r in history if r["role"] in ("user", "assistant")][-10:]:
+                if rec["role"] == "user":
+                    msgs.append(HumanMessage(content=rec["content"]))
+                else:
+                    msgs.append(AIMessage(content=rec["content"]))
+            msgs.append(HumanMessage(content=user_text))
 
             try:
-                return response['text']
-            except Exception:
-                return (getattr(response, "content", None) or str(response) or "").strip()
-    
-        # prefixo: $
-        async def dev_handler2(user_text:str, wa_from: str) -> str:
+                res = await asyncio.to_thread(llm.invoke, msgs)
+                reply = getattr(res, "content", None) or str(res)
+            except Exception as e:
+                print({"type": "gemini_exception", "error": str(e)})
+                reply = "Desculpe, ocorreu um erro."
+
+            save_message("user", user_text)
+            save_message("assistant", reply)
+            await maybe_summarize_with_gemini()
+            return reply.strip()
+
+        # prefixo: $ (GPT-5)
+        async def dev_handler2(user_text: str, wa_from: str) -> str:
             import openai
 
-            # Tive que dar uma alterada em como estava setado o gpt-5, estavam vindo muitos erros da api, aparentemente por ser com o uso do gpt-5 algumas coisas mudam, na prática não mudou nada
             client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+            history = fetch_messages(20)
+            summary = latest_summary()
+
+            context = (
+                """
+                Você é um consultor agrícola especializado em produção e manejo de maçãs.
+                Seu papel é orientar produtores sobre plantio, irrigação, poda, controle de pragas, colheita e comercialização.
+                Responda de forma clara, prática e técnica, com foco em aumentar a produtividade e a qualidade das maçãs, reduzindo custos e impactos ambientais.
+                Dê dicas objetivas baseadas em boas práticas agrícolas e experiências reais no campo.
+                """.strip()
+            )
+            if summary:
+                context += f"Resumo: {summary}\n"
+            for rec in [r for r in history if r["role"] in ("user", "assistant")][-10:]:
+                context += f"{rec['role']}: {rec['content']}\n"
+            context += f"Usuário: {user_text}"
+
             try:
-                response = await asyncio.to_thread(
+                res = await asyncio.to_thread(
                     lambda: client.responses.create(
                         model="gpt-5-2025-08-07",
-                        reasoning={"effort":"minimal"},
-                        instructions="Você é um assistente de maleicultores brasileiros extremamente prestativo e objetivo que fala apenas em português.",
-                        input=user_text 
+                        reasoning={"effort": "minimal"},
+                        instructions=context,
+                        input=user_text,
                     )
                 )
-                assistant_message = response.output_text
-                
-                return assistant_message.strip() if assistant_message is not None else "Desculpe, ocorreu um erro ao processar sua solicitação."
+                reply = getattr(res, "output_text", "") or "Erro."
             except Exception as e:
-                print({"type":"openai_exception", "error": str(e)})
-                return "Desculpe, ocorreu um erro ao processar sua solicitação."
-    
-        # prefixo: &
-        async def dev_handler3(user_text:str, wa_from: str) -> str:
+                print({"type": "openai_exception", "error": str(e)})
+                reply = "Desculpe, ocorreu um erro ao processar sua solicitação."
+
+            save_message("user", user_text)
+            save_message("assistant", reply)
+            await maybe_summarize_with_gemini()
+            return reply.strip()
+
+        # prefixo: & (DeepSeek)
+        async def dev_handler3(user_text: str, wa_from: str) -> str:
             from langchain_openai import ChatOpenAI
-            from langcahin.schema import SystemMessage, HumanMessage, AIMessage
-            from botocore.exceptions import ClientError
-
-            TABLE = os.getenv("CONV_TABLE", "conversations")
-            ddb = boto3.client("dynamoDB")
-
-            def _ts_ms() -> int:
-                return int(time.time() * 1000)
-            
-            # Salva a mensagem, ts(time stamp), role e o número(wa_from -> PHONE_NUMBER_ID) do usuário
-            def save_message(role: str, body: str) -> None:
-                try:
-                    ddb.put_item(
-                        TableName = TABLE,
-                        Item = {
-                            "wa_from": {"S": wa_from},
-                            "ts": {"N": str(_ts_ms())},
-                            "role": {"S": role},
-                            "content": {"S": body or ""},
-                        },
-                    )
-                except ClientError  as e:
-                    print({"type": "ddb_put_err", "error": str(e)})
-            
-            # Retorna apenas as mensagens do usuário de id = :w
-            # Isso é feito sem intervenção do llm, direcionando o foco do mesmo apenas para o conteúdo das mensagens
-            # Esse trabalho fica pra mais uma das funcionalidades do aws, esse é o DynamoDB, trata-se de um NoSQL
-            def fetch_last(limit: int = 10):
-                try:
-                    resp = ddb.query(
-                        TableName = TABLE,
-                        KeyConditionExpression = "wa_from = :w",
-                        ExpressionAttributeValues = {":w": {"S": wa_from}},
-                        Limit = limit,
-                        ScanIndexForward = False, # -> da mais recente pra mais antiga
-                    )
-
-                    items = resp.get("Items", [])
-                    # e aqui retorna em ordem cronológica
-                    items = list(reversed(items))
-                    out = []
-                    
-                    for it in items:
-                        out.append({
-                            "role": it["role"]["S"],
-                            "body": it["body"]["S"],
-                        })
-
-                    return out
-                except ClientError as e:
-                    print({"type": "ddb_query_err", "error": str(e)})
-                    return []
-            
-            save_message("user", user_text) # do usuário
-
-            history = fetch_last() # Carrega as últimas 10 mensagens(ajustável)
-                                   # Tenha em mente que nessas 10 mensagens estão incluídas as mensagens do LLM, IDEALMENTE serão 50/50 entre user e assistant 
-            
-            # montagem do request. Mudou um pouco por causa do langchain, mas a ideia ainda é a mesma
-            msgs = [SystemMessage(content="Você é um assistente de produtores de maçã brasileiros extremamente prestativo e objetivo que fala apenas em português.")]
-
-            for reg in history:
-                r = reg.get("role", "").lower()
-                b = reg.get("body", "")
-                if r == "user":
-                    msgs.append(HumanMessage(content=b))
-                elif r == "assistant":
-                    msgs.append(AIMessage(content=b))
-            if not msgs or not isinstance(msgs[-1], HumanMessage):
-                msgs.append(HumanMessage(content=user_text))
+            from langchain.schema import SystemMessage, HumanMessage, AIMessage
 
             client = ChatOpenAI(
-                api_key=os.environ.get('DEEPSEEK_API_KEY'),
+                api_key=os.environ.get("DEEPSEEK_API_KEY"),
                 base_url="https://api.deepseek.com",
                 model="deepseek-chat",
                 temperature=0.3,
-                max_tokens=300 # 300 tokens = +/- 300/0.3 = 1000 caracteres, na prática seria um pouco mais, mas considerando apenas testes...
+                max_tokens=300,
             )
+
+            history = fetch_messages(20)
+            summary = latest_summary()
+            msgs = [
+                SystemMessage(
+                    content=
+                    """
+                    Você é um consultor agrícola especializado em produção e manejo de maçãs.
+                    Seu papel é orientar produtores sobre plantio, irrigação, poda, controle de pragas, colheita e comercialização.
+                    Responda de forma clara, prática e técnica, com foco em aumentar a produtividade e a qualidade das maçãs, reduzindo custos e impactos ambientais.
+                    Dê dicas objetivas baseadas em boas práticas agrícolas e experiências reais no campo.
+                    """.strip()
+                )
+            ]
+            if summary:
+                msgs.append(SystemMessage(content=f"Resumo: {summary}"))
+            for rec in [r for r in history if r["role"] in ("user", "assistant")][-10:]:
+                if rec["role"] == "user":
+                    msgs.append(HumanMessage(content=rec["content"]))
+                else:
+                    msgs.append(AIMessage(content=rec["content"]))
+            msgs.append(HumanMessage(content=user_text))
+
             try:
-                response = await asyncio.to_thread(client.invoke, msgs)
-                send = (getattr(response, "body", None) or str(response)).strip()
+                res = await asyncio.to_thread(client.invoke, msgs)
+                reply = getattr(res, "content", "") or str(res)
             except Exception as e:
                 print({"type": "deepseek_exception", "error": str(e)})
-                send = None # Aqui poderia ser a mensagem de fallback pedindo uma nova tentativa, mas como isso ainda é um teste individual, mantive ela no 'reply_text'
-            # Salvando a mensagem do próprio llm, relembrando que ela será uma das 10 mensagens salvas no fetch_class()
-            save_message("assistant", send)
+                reply = "Desculpe, ocorreu um erro ao processar sua solicitação."
 
-            return send
-        
+            save_message("user", user_text)
+            save_message("assistant", reply)
+            await maybe_summarize_with_gemini()
+            return reply.strip()
+
+        # ===========================================
+        # Seleção do LLM
+        # ===========================================
         text = (msg.get("text") or {}).get("body", "").strip()
         if not text:
             text = ""
-
         prefix = text[:1]
         user_text = text[1:].lstrip() if len(text) > 1 else ""
         match prefix:
             case "@":
-                reply_text = await dev_handler1(user_text=user_text, wa_from=wa_from)
+                reply_text = await dev_handler1(user_text, wa_from)
             case "$":
-                reply_text = await dev_handler2(user_text=user_text, wa_from=wa_from)
+                reply_text = await dev_handler2(user_text, wa_from)
             case "&":
-                reply_text = await dev_handler3(user_text=user_text, wa_from=wa_from)
+                reply_text = await dev_handler3(user_text, wa_from)
             case _:
                 reply_text = (
                     "Prefixo de mensagem não definido, por favor use:\n"
@@ -324,33 +394,30 @@ async def incoming(request: Request):
                     "$ [texto] -> Bruno\n"
                     "& [texto] -> Nathaniel\n"
                 )
-         
+
         if C["DRY_RUN"]:
-            print({"type":"wa_outbound_dry_run", "to": wa_from, "text": reply_text[:4096]})
+            print({"type": "wa_outbound_dry_run", "to": wa_from, "text": reply_text[:4096]})
             return {"status": "dry_ok"}
 
-        reply_text = (reply_text or "Parece que algo deu errado, tente novamente por gentileza.")
-        # O Fabricio relatou que tiveram casos onde as respostas dos llms estavam chagando com markdown, então fiz isso aqui pra limpar.
-        # Não tenho certeza, mas acho que dá pra setar algum parâmetro em pra resposta vir como "plaintext", se encontrarem, adicionem pros merges futuros e me avisem
+        # limpa markdown
         reply_text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", reply_text)
-        reply_text = re.sub(r"[`*_~#>]", "", reply_text)
-        reply_text = reply_text.strip()
+        reply_text = re.sub(r"[`*_~#>]", "", reply_text).strip()
         if len(reply_text) > 4096:
             reply_text = reply_text[:4095] + "…"
 
-        # Interrompe o status: typing antes de enviar a resposta do LLM
+        # pausa typing
         try:
-           async with httpx.AsyncClient(timeout = 10) as client_fb2:
-               await client_fb2.post(
-                   url,
-                   headers,
-                   json = {
-                       "messaging_product": "whatsapp",
-                       "to": wa_from,
-                       "type": "typing",
-                       "typing": {"status": "paused"},
-                   },
-               ) 
+            async with httpx.AsyncClient(timeout=10) as fb2:
+                await fb2.post(
+                    wa_api_url,
+                    headers=headers,
+                    json={
+                        "messaging_product": "whatsapp",
+                        "to": wa_from,
+                        "type": "typing",
+                        "typing": {"status": "paused"},
+                    },
+                )
         except Exception as e:
             print({"type": "wa_feedback_err_pause", "error": str(e)})
 
@@ -358,22 +425,18 @@ async def incoming(request: Request):
             "messaging_product": "whatsapp",
             "to": wa_from,
             "type": "text",
-            "text": {"body": reply_text}, # o limite do whatsapp é 4096
+            "text": {"body": reply_text},
         }
-        
+
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(url, json=payload, headers=headers)
+            resp = await client.post(wa_api_url, json=payload, headers=headers)
 
-        txt = resp.text[:4000] # o limite do whatsapp é 4096
-        print({"type":"wa_outbound_resp", "status": resp.status_code, "body": txt})
-
-        if resp.is_success:
-            return {"status": "sent"}
-
-        return {"status": "error", "code": resp.status_code}
+        print({"type": "wa_outbound_resp", "status": resp.status_code, "body": resp.text[:4000]})
+        return {"status": "sent" if resp.is_success else "error", "code": resp.status_code}
 
     except Exception as e:
-        print({"type":"wa_exception", "error": str(e)})
+        print({"type": "wa_exception", "error": str(e)})
         return {"status": "exception"}
+
 
 handler = Mangum(app)
