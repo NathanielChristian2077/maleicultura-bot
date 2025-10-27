@@ -54,7 +54,7 @@ def cfg():
         "VERIFY_TOKEN": env("WHATSAPP_VERIFY_TOKEN"),
         "WABA_TOKEN": clean,
         "PHONE_NUMBER_ID": env("WHATSAPP_PHONE_NUMBER_ID"),
-        "GRAPH_VERSION": env("GRAPH_API_VERSION", "v20.0"),
+        "GRAPH_VERSION": env("GRAPH_API_VERSION", "v23.0"),
         "DRY_RUN": env("DRY_RUN", "false").lower() == "true",
     }
 
