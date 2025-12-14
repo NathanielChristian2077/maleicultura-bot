@@ -1,62 +1,72 @@
 import os
+import re
+import time
+import json
+import asyncio
+from typing import Any, Optional, Literal, Tuple
+
 import httpx
+import boto3
+from botocore.exceptions import ClientError
+
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, Response
 from mangum import Mangum
 
-import boto3
-from botocore.config import Config
-import asyncio
-import re
-import time
+
+# ============================================================
+# App / Clients (nível de módulo para reutilização no Lambda)
+# ============================================================
 
 app = FastAPI()
-_lambda = boto3.client("lambda", config=Config(retries={"max_attempts": 2}))
+_ddb = boto3.client("dynamodb")
 
-_seen_wamids: dict[str, float] = {}
-_DEDUP_TTL_SEC = 600
-_user_state: dict[str, dict] = {}
-_STATE_TTL_SEC = 1800  # 30min, ajusta se quiser
 
-def _state_gc():
-    now = time.time()
-    expired = []
-    for k, st in _user_state.items():
-        ts = st.get("_ts", 0)
-        if now - ts > _STATE_TTL_SEC:
-            expired.append(k)
-    for k in expired:
-        _user_state.pop(k, None)
+# ============================================================
+# Constantes / Config
+# ============================================================
 
-def get_state(wa_from: str) -> dict:
-    _state_gc()
-    st = _user_state.get(wa_from)
-    if not st:
-        return {"stage": "choose_llm"}
-    return st
+SYSTEM_PROMPT = """
+Você é um consultor agrícola especializado em produção e manejo de maçãs.
+Seu papel é orientar produtores sobre plantio, irrigação, poda, controle de pragas, colheita e comercialização.
+Responda de forma clara, prática e técnica, com foco em aumentar a produtividade e a qualidade das maçãs, reduzindo custos e impactos ambientais.
+Dê dicas objetivas baseadas em boas práticas agrícolas e experiências reais no campo.
+""".strip()
 
-def set_state(wa_from: str, **kwargs):
-    _state_gc()
-    st = _user_state.get(wa_from) or {}
-    st.update(kwargs)
-    st["_ts"] = time.time()
-    _user_state[wa_from] = st
+MAX_WA_TEXT = 4096
 
-def reset_state(wa_from: str):
-    _user_state.pop(wa_from, None)
+# WhatsApp Cloud API: reply buttons (max 3)
+MENU_TITLE_MAX = 20
+MENU_ID_MAX = 256
+MENU_BODY_MAX = 1024
 
-def seen_bfr(wamid: str):
-    now = time.time()
-    expired = [k for k, ts in _seen_wamids.items() if now - ts > _DEDUP_TTL_SEC]
-    for k in expired:
-        _seen_wamids.pop(k, None)
-    if not wamid:
-        return False
-    if wamid in _seen_wamids:
-        return True
-    _seen_wamids[wamid] = now
-    return False
+GRAPH_DEFAULT_VERSION = os.getenv("GRAPH_API_VERSION", "v23.0")
 
+# TTLs (ajustáveis por env se quiser)
+_DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "600"))
+_STATE_TTL_SEC = int(os.getenv("STATE_TTL_SEC", "1800"))  # 30min
+
+# Dynamo (conversas) - "memória" 
+CONV_TABLE = os.getenv("CONV_TABLE", "conversations")
+CONV_TOKEN_LIMIT = int(os.getenv("CONV_TOKEN_LIMIT", "2000"))
+CONV_TTL_DAYS = int(os.getenv("CONV_TTL_DAYS", "7"))
+
+# Regex precompile (performance + consistência) - limpa markdowns, os quais o wpp não mostra
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_MD_GARBAGE_RE = re.compile(r"[`*_~#>]")
+
+
+# ============================================================
+# Logger simples (prints estruturados)
+# ============================================================
+
+def log(event: str, **fields: Any) -> None:
+    print({"type": event, **fields})
+
+
+# ============================================================
+# Env helpers / runtime config
+# ============================================================
 
 def env(name: str, default: str = "") -> str:
     fallback_map = {
@@ -75,17 +85,613 @@ def env(name: str, default: str = "") -> str:
     return val if val is not None else default
 
 
-def cfg():
-    raw = env("WHATSAPP_TOKEN")
-    clean = (raw or "").replace("\r", "").replace("\n", "").strip().strip('"').strip("'")
+def clean_token(raw: str) -> str:
+    return (raw or "").replace("\r", "").replace("\n", "").strip().strip('"').strip("'")
+
+
+def cfg() -> dict[str, Any]:
+    token = clean_token(env("WHATSAPP_TOKEN"))
     return {
         "VERIFY_TOKEN": env("WHATSAPP_VERIFY_TOKEN"),
-        "WABA_TOKEN": clean,
+        "WABA_TOKEN": token,
         "PHONE_NUMBER_ID": env("WHATSAPP_PHONE_NUMBER_ID"),
-        "GRAPH_VERSION": env("GRAPH_API_VERSION", "v23.0"),
+        "GRAPH_VERSION": env("GRAPH_API_VERSION", GRAPH_DEFAULT_VERSION),
         "DRY_RUN": env("DRY_RUN", "false").lower() == "true",
     }
 
+
+def wa_api_url(C: dict[str, Any]) -> str:
+    # Graph API endpoint: /{PHONE_NUMBER_ID}/messages
+    return f"https://graph.facebook.com/{C['GRAPH_VERSION']}/{C['PHONE_NUMBER_ID']}/messages"
+
+
+def wa_headers(C: dict[str, Any]) -> dict[str, str]:
+    token = clean_token(C.get("WABA_TOKEN") or "")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+# ============================================================
+# Deduplicação em memória (wamid) com GC
+# Objetivo: evitar reprocessar retries do WhatsApp (gera loops infinitos de retry ou causa respostas desincronizadas com as perguntas).
+# ============================================================
+
+_seen_wamids: dict[str, float] = {}
+
+
+def dedup_gc() -> None:
+    now = time.time()
+    expired = [k for k, ts in _seen_wamids.items() if now - ts > _DEDUP_TTL_SEC]
+    for k in expired:
+        _seen_wamids.pop(k, None)
+
+
+def seen_before(wamid: Optional[str]) -> bool:
+    dedup_gc()
+    if not wamid:
+        return False
+    now = time.time()
+    if wamid in _seen_wamids:
+        return True
+    _seen_wamids[wamid] = now
+    return False
+
+
+# ============================================================
+# Estado em memória do usuário (escolhas de menu)
+# NÃO é persistido entre execuções / instâncias.
+# Isso é intencional por enquanto.
+# Considerando que ainda não existe nenhum modo além do normal e ainda não sabemos se tudo será mantido ou apenas o LLM + mode que se sair melhor.
+# ============================================================
+
+_user_state: dict[str, dict[str, Any]] = {}
+
+
+def state_gc() -> None:
+    now = time.time()
+    expired = []
+    for k, st in _user_state.items():
+        ts = float(st.get("_ts", 0))
+        if now - ts > _STATE_TTL_SEC:
+            expired.append(k)
+    for k in expired:
+        _user_state.pop(k, None)
+
+
+def get_state(wa_from: str) -> dict[str, Any]:
+    state_gc()
+    st = _user_state.get(wa_from)
+    if not st:
+        return {"stage": "choose_llm"}
+    return st
+
+
+def set_state(wa_from: str, **kwargs: Any) -> None:
+    state_gc()
+    st = _user_state.get(wa_from) or {}
+    st.update(kwargs)
+    st["_ts"] = time.time()
+    _user_state[wa_from] = st
+
+
+def reset_state(wa_from: str) -> None:
+    _user_state.pop(wa_from, None)
+
+
+# ============================================================
+# Dynamo Conversation Memory + Summarization
+# ============================================================
+
+def _ts_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _ttl_epoch_seconds(days: int) -> int:
+    # DynamoDB TTL usa epoch em segundos
+    return int(time.time()) + days * 86400
+
+
+def _approx_tokens(text: str) -> int:
+    # Aproximação simples -> suficiente para "trigger de resumo".
+    if not text:
+        return 0
+    return max(1, int(len(text.split()) / 0.75))
+
+
+def save_message(wa_from: str, role: str, content: str) -> None:
+    try:
+        _ddb.put_item(
+            TableName=CONV_TABLE,
+            Item={
+                "wa_from": {"S": wa_from},
+                "ts": {"N": str(_ts_ms())},
+                "role": {"S": role},
+                "content": {"S": content or ""},
+                "ttl": {"N": str(_ttl_epoch_seconds(CONV_TTL_DAYS))},
+            },
+        )
+    except ClientError as e:
+        log("ddb_put_err", error=str(e))
+
+
+def fetch_messages(wa_from: str, limit: int = 50) -> list[dict[str, Any]]:
+    try:
+        resp = _ddb.query(
+            TableName=CONV_TABLE,
+            KeyConditionExpression="wa_from = :w",
+            ExpressionAttributeValues={":w": {"S": wa_from}},
+            Limit=limit,
+            ScanIndexForward=False,
+        )
+        items = list(reversed(resp.get("Items", [])))
+        return [
+            {"ts": int(it["ts"]["N"]), "role": it["role"]["S"], "content": it["content"]["S"]}
+            for it in items
+        ]
+    except ClientError as e:
+        log("ddb_query_err", error=str(e))
+        return []
+
+
+def latest_summary(wa_from: str, limit: int = 120) -> Optional[str]:
+    hist = fetch_messages(wa_from, limit)
+    for rec in reversed(hist):
+        if rec["role"] == "system_summary":
+            return rec["content"]
+    return None
+
+
+async def maybe_summarize_with_gemini(wa_from: str) -> None:
+    history = fetch_messages(wa_from, 120)
+    joined = "\n".join(f"{r['role']}: {r['content']}" for r in history)
+    total = _approx_tokens(joined)
+    if total <= CONV_TOKEN_LIMIT:
+        return
+
+    log("token_limit_hit", wa_from=wa_from, tokens=total)
+
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain.schema import HumanMessage
+
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=env("GEMINI_API_KEY"),
+        convert_system_message_to_human=True,
+        temperature=0.3,
+        max_output_tokens=500,
+    )
+    prompt = "Resuma o diálogo a seguir de forma breve, mantendo informações importantes e contexto:\n\n" + joined
+
+    try:
+        res = await asyncio.to_thread(llm.invoke, [HumanMessage(content=prompt)])
+        summary = getattr(res, "content", "") or str(res)
+        summary = (summary or "").strip()
+        if summary:
+            save_message(wa_from, "system_summary", summary[:2000])
+            log("summary_created", wa_from=wa_from, length=len(summary))
+    except Exception as e:
+        log("summary_exception", wa_from=wa_from, error=str(e))
+
+
+# ============================================================
+# LLM Handlers (Gemini / GPT / DeepSeek)
+# ============================================================
+
+def build_context_block(wa_from: str, max_history: int = 20) -> tuple[str, list[dict[str, Any]], Optional[str]]:
+    history = fetch_messages(wa_from, max_history)
+    summary = latest_summary(wa_from)
+    return SYSTEM_PROMPT, history, summary
+
+
+async def handler_gemini(wa_from: str, user_text: str) -> str:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain.schema import SystemMessage, HumanMessage, AIMessage
+
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=env("GEMINI_API_KEY"),
+        convert_system_message_to_human=True,
+        temperature=0.3,
+        max_output_tokens=300,
+    )
+
+    system, history, summary = build_context_block(wa_from, max_history=30)
+
+    msgs: list[Any] = [SystemMessage(content=system)]
+    if summary:
+        msgs.append(SystemMessage(content=f"Resumo: {summary}"))
+
+    for rec in [r for r in history if r["role"] in ("user", "assistant")][-10:]:
+        if rec["role"] == "user":
+            msgs.append(HumanMessage(content=rec["content"]))
+        else:
+            msgs.append(AIMessage(content=rec["content"]))
+    msgs.append(HumanMessage(content=user_text))
+
+    try:
+        res = await asyncio.to_thread(llm.invoke, msgs)
+        reply = getattr(res, "content", None) or str(res)
+    except Exception as e:
+        log("gemini_exception", wa_from=wa_from, error=str(e))
+        reply = "Desculpe, ocorreu um erro."
+
+    save_message(wa_from, "user", user_text)
+    save_message(wa_from, "assistant", reply)
+    await maybe_summarize_with_gemini(wa_from)
+    return (reply or "").strip()
+
+
+async def handler_gpt(wa_from: str, user_text: str) -> str:
+    import openai
+
+    client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+
+    system, history, summary = build_context_block(wa_from, max_history=20)
+
+    context = system + "\n"
+    if summary:
+        context += f"Resumo: {summary}\n"
+    for rec in [r for r in history if r["role"] in ("user", "assistant")][-10:]:
+        context += f"{rec['role']}: {rec['content']}\n"
+    context += f"Usuário: {user_text}"
+
+    try:
+        res = await asyncio.to_thread(
+            lambda: client.responses.create(
+                model="gpt-5-2025-08-07",
+                reasoning={"effort": "minimal"},
+                instructions=context,
+                input=user_text,
+            )
+        )
+        reply = getattr(res, "output_text", "") or "Erro."
+    except Exception as e:
+        log("openai_exception", wa_from=wa_from, error=str(e))
+        reply = "Desculpe, ocorreu um erro ao processar sua solicitação."
+
+    save_message(wa_from, "user", user_text)
+    save_message(wa_from, "assistant", reply)
+    await maybe_summarize_with_gemini(wa_from)
+    return (reply or "").strip()
+
+
+async def handler_deepseek(wa_from: str, user_text: str) -> str:
+    from langchain_openai import ChatOpenAI
+    from langchain.schema import SystemMessage, HumanMessage, AIMessage
+
+    client = ChatOpenAI(
+        api_key=os.environ.get("DEEPSEEK_API_KEY"),
+        base_url="https://api.deepseek.com",
+        model="deepseek-chat",
+        temperature=0.3,
+        max_tokens=300,
+    )
+
+    system, history, summary = build_context_block(wa_from, max_history=20)
+
+    msgs: list[Any] = [SystemMessage(content=system)]
+    if summary:
+        msgs.append(SystemMessage(content=f"Resumo: {summary}"))
+
+    for rec in [r for r in history if r["role"] in ("user", "assistant")][-10:]:
+        if rec["role"] == "user":
+            msgs.append(HumanMessage(content=rec["content"]))
+        else:
+            msgs.append(AIMessage(content=rec["content"]))
+    msgs.append(HumanMessage(content=user_text))
+
+    try:
+        res = await asyncio.to_thread(client.invoke, msgs)
+        reply = getattr(res, "content", "") or str(res)
+    except Exception as e:
+        log("deepseek_exception", wa_from=wa_from, error=str(e))
+        reply = "Desculpe, ocorreu um erro ao processar sua solicitação."
+
+    save_message(wa_from, "user", user_text)
+    save_message(wa_from, "assistant", reply)
+    await maybe_summarize_with_gemini(wa_from)
+    return (reply or "").strip()
+
+
+def route_llm(llm_key: str):
+    if llm_key == "gemini":
+        return handler_gemini
+    if llm_key == "gpt":
+        return handler_gpt
+    if llm_key == "deepseek":
+        return handler_deepseek
+    return None
+
+
+# ============================================================
+# WhatsApp Send Helpers (text / interactive / feedback)
+# ============================================================
+
+def clean_reply_text(text: str) -> str:
+    # Remove links markdown e alguns caracteres de formatação
+    text = _MD_LINK_RE.sub(r"\1", text or "")
+    text = _MD_GARBAGE_RE.sub("", text).strip()
+    if len(text) > MAX_WA_TEXT:
+        text = text[: MAX_WA_TEXT - 1] + "…"
+    return text
+
+
+async def wa_send_text(
+    client: httpx.AsyncClient,
+    api_url: str,
+    headers: dict[str, str],
+    to: str,
+    body: str
+) -> httpx.Response:
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": body},
+    }
+    resp = await client.post(api_url, json=payload, headers=headers)
+    log("wa_out_text", status=resp.status_code, body=resp.text[:1500])
+    return resp
+
+
+async def wa_send_interactive_buttons(
+    client: httpx.AsyncClient,
+    api_url: str,
+    headers: dict[str, str],
+    to: str,
+    body_text: str,
+    buttons: list[Tuple[str, str]],
+) -> httpx.Response:
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": (body_text or "")[:MENU_BODY_MAX]},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": bid[:MENU_ID_MAX], "title": title[:MENU_TITLE_MAX]}}
+                    for (bid, title) in buttons[:3]
+                ]
+            },
+        },
+    }
+    resp = await client.post(api_url, json=payload, headers=headers)
+    log("wa_out_interactive", status=resp.status_code, body=resp.text[:1500])
+    return resp
+
+
+async def wa_mark_read(
+    client: httpx.AsyncClient,
+    api_url: str,
+    headers: dict[str, str],
+    wamid: str
+) -> None:
+    try:
+        await client.post(
+            api_url,
+            headers=headers,
+            json={"messaging_product": "whatsapp", "status": "read", "message_id": wamid},
+        )
+    except Exception as e:
+        log("wa_feedback_err_read", error=str(e))
+
+
+async def wa_typing(
+    client: httpx.AsyncClient,
+    api_url: str,
+    headers: dict[str, str],
+    to: str,
+    status: Literal["typing", "paused"]
+) -> None:
+    try:
+        await client.post(
+            api_url,
+            headers=headers,
+            json={"messaging_product": "whatsapp", "to": to, "type": "typing", "typing": {"status": status}},
+        )
+    except Exception as e:
+        log("wa_feedback_err_typing", status=status, error=str(e))
+
+
+async def send_llm_menu(
+    client: httpx.AsyncClient,
+    api_url: str,
+    headers: dict[str, str],
+    wa_from: str
+) -> None:
+    await wa_send_interactive_buttons(
+        client,
+        api_url,
+        headers,
+        wa_from,
+        "Escolha o modelo que vai responder:",
+        [("llm_gemini", "Gemini"), ("llm_gpt", "ChatGPT"), ("llm_deepseek", "DeepSeek")],
+    )
+
+
+async def send_mode_menu(
+    client: httpx.AsyncClient,
+    api_url: str,
+    headers: dict[str, str],
+    wa_from: str
+) -> None:
+    await wa_send_interactive_buttons(
+        client,
+        api_url,
+        headers,
+        wa_from,
+        "Escolha o modo (por enquanto todos vão pro modo normal):",
+        [("mode_normal", "Normal"), ("mode_rag", "RAG"), ("mode_ft", "Fine-tuning")],
+    )
+
+
+# ============================================================
+# Helpers de parse do payload
+# ============================================================
+
+def extract_value(payload: dict[str, Any]) -> dict[str, Any]:
+    entry = (payload.get("entry") or [{}])[0]
+    change = (entry.get("changes") or [{}])[0]
+    return change.get("value") or {}
+
+
+def extract_message(value: dict[str, Any]) -> Optional[dict[str, Any]]:
+    msgs = value.get("messages") or []
+    if not msgs:
+        return None
+    return msgs[0]
+
+
+def extract_text(msg: dict[str, Any]) -> str:
+    return ((msg.get("text") or {}).get("body") or "").strip()
+
+
+def extract_button_id(msg: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    inter = msg.get("interactive") or {}
+    br = inter.get("button_reply") or {}
+    return br.get("id"), br.get("title")
+
+
+# ============================================================
+# Interativos (botões)
+# ============================================================
+
+async def handle_interactive(
+    client: httpx.AsyncClient,
+    api_url: str,
+    headers: dict[str, str],
+    wa_from: str,
+    msg: dict[str, Any],
+) -> dict[str, Any]:
+    button_id, button_title = extract_button_id(msg)
+    log("wa_button_click", wa_from=wa_from, id=button_id, title=button_title)
+
+    if not button_id:
+        await wa_send_interactive_buttons(
+            client, api_url, headers, wa_from,
+            "Não entendi tua seleção. Vamos de novo.",
+            [("menu_reset", "Reset"), ("menu_help", "Ajuda"), ("menu_keep", "Manter")],
+        )
+        return {"status": "ok_no_button_id"}
+
+    if button_id in ("llm_gemini", "llm_gpt", "llm_deepseek"):
+        llm = {"llm_gemini": "gemini", "llm_gpt": "gpt", "llm_deepseek": "deepseek"}[button_id]
+        set_state(wa_from, stage="choose_mode", llm=llm)
+        await send_mode_menu(client, api_url, headers, wa_from)
+        return {"status": "ok_llm_selected"}
+
+    if button_id in ("mode_normal", "mode_rag", "mode_ft"):
+        mode = {"mode_normal": "normal", "mode_rag": "rag", "mode_ft": "finetune"}[button_id]
+
+        st = get_state(wa_from)
+        if not st.get("llm"):
+            # Se o usuário selecionou modo sem LLM, recupera o fluxo
+            reset_state(wa_from)
+            await send_llm_menu(client, api_url, headers, wa_from)
+            return {"status": "need_llm_first"}
+
+        # Por enquanto, o modo (normal / RAG / fine-tuning) é apenas UI.
+        # Todos os modos roteiam para o handler normal.
+        set_state(wa_from, stage="ready", mode=mode)
+
+        llm_show = (get_state(wa_from).get("llm") or "").upper()
+        await wa_send_interactive_buttons(
+            client, api_url, headers, wa_from,
+            f"Fechado.\nLLM: {llm_show}\nModo: {mode}\n\nAgora manda tua pergunta.",
+            [("menu_reset", "Trocar"), ("menu_keep", "Manter"), ("menu_help", "Ajuda")],
+        )
+        return {"status": "ok_mode_selected"}
+
+    if button_id == "menu_reset":
+        reset_state(wa_from)
+        await send_llm_menu(client, api_url, headers, wa_from)
+        return {"status": "ok_reset"}
+
+    if button_id == "menu_help":
+        await wa_send_interactive_buttons(
+            client, api_url, headers, wa_from,
+            "Fluxo:\n1) Escolhe o LLM\n2) Escolhe o modo\n3) Manda a pergunta\n\nReset pra trocar tudo.",
+            [("menu_reset", "Reset"), ("menu_keep", "Manter"), ("menu_help", "Ajuda")],
+        )
+        return {"status": "ok_help"}
+
+    if button_id == "menu_keep":
+        return {"status": "ok_keep"}
+
+    await wa_send_interactive_buttons(
+        client, api_url, headers, wa_from,
+        "Seleção inválida. Vamos de novo.",
+        [("menu_reset", "Reset"), ("menu_help", "Ajuda"), ("menu_keep", "Manter")],
+    )
+    return {"status": "ok_unknown_button"}
+
+
+# ============================================================
+# Roteamento de mensagens de texto
+# ============================================================
+
+async def handle_text_message(
+    client: httpx.AsyncClient,
+    C: dict[str, Any],
+    api_url: str,
+    headers: dict[str, str],
+    wa_from: str,
+    wamid: Optional[str],
+    text: str,
+) -> dict[str, Any]:
+    # Gate: se ainda não escolheu tudo do menu, força o fluxo
+    st = get_state(wa_from)
+    if text and st.get("stage") != "ready":
+        if st.get("stage") == "choose_mode" and st.get("llm"):
+            await send_mode_menu(client, api_url, headers, wa_from)
+            return {"status": "need_mode"}
+        await send_llm_menu(client, api_url, headers, wa_from)
+        return {"status": "need_llm"}
+
+    # Feedback visual (best effort)
+    if wamid:
+        await wa_mark_read(client, api_url, headers, wamid)
+    await wa_typing(client, api_url, headers, wa_from, "typing")
+
+    prefix = text[:1] if text else ""
+    user_text = text[1:].lstrip() if len(text) > 1 else text
+
+    reply_text: str
+    if prefix == "@":
+        reply_text = await handler_gemini(wa_from, user_text)
+    elif prefix == "$":
+        reply_text = await handler_gpt(wa_from, user_text)
+    elif prefix == "&":
+        reply_text = await handler_deepseek(wa_from, user_text)
+    else:
+        llm_key = (get_state(wa_from).get("llm") or "").strip()
+        handler = route_llm(llm_key)
+        if not handler:
+            reset_state(wa_from)
+            await send_llm_menu(client, api_url, headers, wa_from)
+            return {"status": "need_llm_again"}
+        reply_text = await handler(wa_from, user_text)
+
+    if C.get("DRY_RUN"):
+        log("wa_outbound_dry_run", to=wa_from, text=reply_text[:MAX_WA_TEXT])
+        return {"status": "dry_ok"}
+
+    reply_text = clean_reply_text(reply_text)
+
+    # Para o typing e envia
+    await wa_typing(client, api_url, headers, wa_from, "paused")
+    resp = await wa_send_text(client, api_url, headers, wa_from, reply_text)
+    return {"status": "sent" if resp.is_success else "error", "code": resp.status_code}
+
+
+# ============================================================
+# FastAPI routes
+# ============================================================
 
 @app.get("/webhook")
 async def verify(request: Request):
@@ -99,485 +705,81 @@ async def verify(request: Request):
         return PlainTextResponse(challenge)
     return Response(status_code=403)
 
+
 @app.post("/webhook")
 async def incoming(request: Request):
     C = cfg()
+
+    # "soft" fail: retorna ok pra evitar retries infinitos do provedor
+    if not C.get("PHONE_NUMBER_ID") or not C.get("WABA_TOKEN"):
+        log("cfg_missing", phone_number_id=bool(C.get("PHONE_NUMBER_ID")), token=bool(C.get("WABA_TOKEN")))
+        return {"status": "ok", "warning": "missing_config"}
+
+    api_url = wa_api_url(C)
+    headers = wa_headers(C)
+
     try:
         raw = await request.body()
-        print({"type": "wa_inbound_raw", "len": len(raw)})
-        body = await request.json()
-        print({"type": "wa_inbound_parsed", "keys": list(body.keys())})
+        log("wa_inbound_raw", len=len(raw))
 
-        entry = (body.get("entry") or [{}])[0]
-        change = (entry.get("changes") or [{}])[0]
-        value = change.get("value") or {}
+        
+        try:
+            body = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
+        except Exception:
+            body = await request.json()
 
+        log("wa_inbound_parsed", keys=list(body.keys()) if isinstance(body, dict) else "non_dict")
+
+        value = extract_value(body if isinstance(body, dict) else {})
+
+        
         if not value.get("messages"):
-            print({"type": "wa_inbound_skip", "reason": "no_messages_key"})
+            statuses = value.get("statuses") or []
+            log("wa_inbound_status", count=len(statuses), statuses=statuses[:3])
             return {"status": "ok"}
 
-        msg = value["messages"][0]
-        wa_type = msg.get("type")
-                
-        # Botões do menu
-        if wa_type == "interactive":
-            inter = msg.get("interactive") or {}
-
-            # reply buttons
-            br = inter.get("button_reply") or {}
-            button_id = br.get("id")
-            button_title = br.get("title")
-
-            print({"type": "wa_button_click", "from": wa_from, "id": button_id, "title": button_title})
-
-            st = get_state(wa_from)
-
-            if button_id in ("llm_gemini", "llm_gpt", "llm_deepseek"):
-                llm = {"llm_gemini": "gemini", "llm_gpt": "gpt", "llm_deepseek": "deepseek"}[button_id]
-                set_state(wa_from, stage="choose_mode", llm=llm)
-                await send_mode_menu()
-                return {"status": "ok_llm_selected"}
-
-            if button_id in ("mode_normal", "mode_rag", "mode_ft"):
-                mode = {"mode_normal": "normal", "mode_rag": "rag", "mode_ft": "finetune"}[button_id]
-                # por enquanto: só roteia para o mode normal
-                set_state(wa_from, stage="ready", mode=mode)
-
-                llm = (get_state(wa_from).get("llm") or "").upper()
-                await wa_send_interactive_buttons(
-                    wa_from,
-                    f"Fechado.\nLLM: {llm}\nModo: {mode}\n\nAgora manda tua pergunta.",
-                    [("menu_reset", "Trocar"), ("menu_keep", "Manter"), ("menu_help", "Ajuda")],
-                )
-                return {"status": "ok_mode_selected"}
-
-            if button_id == "menu_reset":
-                reset_state(wa_from)
-                await send_llm_menu()
-                return {"status": "ok_reset"}
-
-            if button_id == "menu_help":
-                await wa_send_interactive_buttons(
-                    wa_from,
-                    "Fluxo:\n1) Escolhe o LLM\n2) Escolhe o modo\n3) Manda a pergunta\n\nReset pra trocar tudo.",
-                    [("menu_reset", "Reset"), ("menu_keep", "Manter"), ("menu_help", "Ajuda")],
-                )
-                return {"status": "ok_help"}
-
-            # menu_keep ou qualquer coisa desconhecida
-            if button_id == "menu_keep":
-                return {"status": "ok_keep"}
-
-            await wa_send_interactive_buttons(
-                wa_from,
-                "Seleção inválida. Vamos de novo.",
-                [("menu_reset", "Reset"), ("menu_help", "Ajuda"), ("menu_keep", "Manter")],
-            )
-            return {"status": "ok_unknown_button"}
-
-        wa_from = msg.get("from")
-        is_echo = msg.get("from") == (value.get("metadata") or {}).get("display_phone_number")
-        if is_echo:
-            print({"type": "wa_inbound_skip", "reason": "echo"})
+        msg = extract_message(value)
+        if not msg:
+            log("wa_inbound_skip", reason="messages_empty_after_check")
             return {"status": "ok"}
+
+
+
+        wa_from = msg.get("from") or ""
+        wa_type = msg.get("type") or ""
+
+        # Best-effort echo detection
+        try:
+            meta = value.get("metadata") or {}
+            display_phone = meta.get("display_phone_number")
+            if display_phone and wa_from == display_phone:
+                log("wa_inbound_skip", reason="echo_like")
+                return {"status": "ok"}
+        except Exception:
+            pass
 
         wamid = msg.get("id") or msg.get("wamid")
-        if seen_bfr(wamid):
-            print({"type": "wa_inbound_skip", "reason": "duplicate_wamid", "wamid": wamid})
+        if seen_before(wamid):
+            log("wa_inbound_skip", reason="duplicate_wamid", wamid=wamid)
             return {"status": "ok"}
 
-        print({"type": "wa_inbound_message", "from": wa_from, "msg_type": wa_type})
-
-        wa_api_url = f"https://graph.facebook.com/{C['GRAPH_VERSION']}/{C['PHONE_NUMBER_ID']}/messages"
-
-        token = (C["WABA_TOKEN"] or "")
-        token = token.replace("\r", "").replace("\n", "").strip().strip('"').strip("'")
-
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-
-        # Feedback visual: read e typing
-        try:
-            async with httpx.AsyncClient(timeout=10) as fb:
-                await fb.post(
-                    wa_api_url,
-                    headers=headers,
-                    json={
-                        "messaging_product": "whatsapp",
-                        "status": "read",
-                        "message_id": wamid,
-                    },
-                )
-                await fb.post(
-                    wa_api_url,
-                    headers=headers,
-                    json={
-                        "messaging_product": "whatsapp",
-                        "to": wa_from,
-                        "type": "typing",
-                        "typing": {"status": "typing"},
-                    },
-                )
-        except Exception as e:
-            print({"type": "wa_feedback_err", "error": str(e)})
-
-        # Menu para escolha de modelo
-        async def wa_send_interactive_buttons(to: str, body_text: str, buttons: list[tuple[str, str]]):
-            payload = {
-                "messaging_product": "whatsapp",
-                "to": to,
-                "type": "interactive",
-                "interactive": {
-                    "type": "button",
-                    "body": {"text": body_text[:1024]},
-                    "action": {
-                        "buttons": [
-                            {"type": "reply", "reply": {"id": bid[:256], "title": title[:20]}}
-                            for (bid, title) in buttons[:3]
-                        ]
-                    },
-                },
-            }
-
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(wa_api_url, json=payload, headers=headers)
-
-            print({"type": "wa_out_interactive", "status": resp.status_code, "body": resp.text[:2000]})
-            return resp
-        
-        async def send_llm_menu():
-            await wa_send_interactive_buttons(
-                wa_from,
-                "Escolha o modelo que vai responder:",
-                [("llm_gemini", "Gemini"), ("llm_gpt", "ChatGPT"), ("llm_deepseek", "DeepSeek")],
-            )
-
-        async def send_mode_menu():
-            await wa_send_interactive_buttons(
-                wa_from,
-                "Escolha o modo (por enquanto todos vão pro modo normal):",
-                [("mode_normal", "Normal"), ("mode_rag", "RAG"), ("mode_ft", "Fine-tuning")],
-            )
-
-
-        # ===========================================
-        #  MEMÓRIA DynamoDB e Resumo (Gemini)
-        # ===========================================
-        # Direcionei todos os resumos pro Gemini (já que não tem custo), por enquanto é apenas para testes
-        from botocore.exceptions import ClientError
-
-        CONV_TABLE = os.getenv("CONV_TABLE", "conversations")
-        CONV_TOKEN_LIMIT = int(os.getenv("CONV_TOKEN_LIMIT", "2000"))
-        CONV_TTL_DAYS = int(os.getenv("CONV_TTL_DAYS", "7")) # A cada 7 dias a conversa é apagada dos registros
-        ddb = boto3.client("dynamodb")
-        
-        def _ttl_epoch_seconds(days: int) -> int:
-           return int(time.time()) + days * 86400 # Dynamo precisa dos dias em segundos 
-
-        def _ts_ms():
-            return int(time.time() * 1000)
-
-        def _approx_tokens(text: str):
-            if not text:
-                return 0
-            return max(1, int(len(text.split()) / 0.75))
-
-        def save_message(role: str, content: str):
-            try:
-                ddb.put_item(
-                    TableName=CONV_TABLE,
-                    Item={
-                        "wa_from": {"S": wa_from},
-                        "ts": {"N": str(_ts_ms())},
-                        "role": {"S": role},
-                        "content": {"S": content or ""},
-                        "ttl": {"N": str(_ttl_epoch_seconds(CONV_TTL_DAYS))},  # TTL em segundos
-                    },
-                )
-            except ClientError as e:
-                print({"type": "ddb_put_err", "error": str(e)})
-
-        def fetch_messages(limit: int = 50):
-            try:
-                resp = ddb.query(
-                    TableName=CONV_TABLE,
-                    KeyConditionExpression="wa_from = :w",
-                    ExpressionAttributeValues={":w": {"S": wa_from}},
-                    Limit=limit,
-                    ScanIndexForward=False,
-                )
-                items = list(reversed(resp.get("Items", [])))
-                return [
-                    {
-                        "ts": int(it["ts"]["N"]),
-                        "role": it["role"]["S"],
-                        "content": it["content"]["S"],
-                    }
-                    for it in items
-                ]
-            except ClientError as e:
-                print({"type": "ddb_query_err", "error": str(e)})
-                return []
-
-        async def maybe_summarize_with_gemini():
-            history = fetch_messages(100)
-            joined = "\n".join(f"{r['role']}: {r['content']}" for r in history)
-            total = _approx_tokens(joined)
-            if total <= CONV_TOKEN_LIMIT:
-                return
-
-            print({"type": "token_limit_hit", "tokens": total})
-            from langchain_google_genai import ChatGoogleGenerativeAI
-            from langchain.schema import HumanMessage
-
-            llm = ChatGoogleGenerativeAI(
-                model="gemini-2.5-flash",
-                google_api_key=env("GEMINI_API_KEY"),
-                convert_system_message_to_human=True,
-                temperature=0.3,
-                max_output_tokens=500,
-            )
-            prompt = (
-                "Resuma o diálogo a seguir de forma breve, mantendo informações importantes e contexto:\n\n"
-                + joined
-            )
-            try:
-                res = await asyncio.to_thread(llm.invoke, [HumanMessage(content=prompt)])
-                summary = getattr(res, "content", "") or str(res)
-                if summary:
-                    save_message("system_summary", summary.strip()[:2000])
-                    print({"type": "summary_created", "len": len(summary)})
-            except Exception as e:
-                print({"type": "summary_exception", "error": str(e)})
-
-        def latest_summary():
-            for rec in reversed(fetch_messages(100)):
-                if rec["role"] == "system_summary":
-                    return rec["content"]
-            return None
-
-        # ===========================================
-        #               HANDLERS
-        # ===========================================
-        # prefixo: @ (Gemini)
-        async def dev_handler1(user_text: str, wa_from: str) -> str:
-            from langchain_google_genai import ChatGoogleGenerativeAI
-            from langchain.schema import SystemMessage, HumanMessage, AIMessage
-
-            llm = ChatGoogleGenerativeAI(
-                model="gemini-2.5-flash",
-                google_api_key=env("GEMINI_API_KEY"),
-                convert_system_message_to_human=True,
-                temperature=0.3,
-                max_output_tokens=300,
-            )
-
-            history = fetch_messages(30)
-            summary = latest_summary()
-
-            msgs = [
-                SystemMessage(
-                    content=
-                    """
-                    Você é um consultor agrícola especializado em produção e manejo de maçãs.
-                    Seu papel é orientar produtores sobre plantio, irrigação, poda, controle de pragas, colheita e comercialização.
-                    Responda de forma clara, prática e técnica, com foco em aumentar a produtividade e a qualidade das maçãs, reduzindo custos e impactos ambientais.
-                    Dê dicas objetivas baseadas em boas práticas agrícolas e experiências reais no campo.
-                    """.strip()
-                )
-            ]
-            if summary:
-                msgs.append(SystemMessage(content=f"Resumo: {summary}"))
-            for rec in [r for r in history if r["role"] in ("user", "assistant")][-10:]:
-                if rec["role"] == "user":
-                    msgs.append(HumanMessage(content=rec["content"]))
-                else:
-                    msgs.append(AIMessage(content=rec["content"]))
-            msgs.append(HumanMessage(content=user_text))
-
-            try:
-                res = await asyncio.to_thread(llm.invoke, msgs)
-                reply = getattr(res, "content", None) or str(res)
-            except Exception as e:
-                print({"type": "gemini_exception", "error": str(e)})
-                reply = "Desculpe, ocorreu um erro."
-
-            save_message("user", user_text)
-            save_message("assistant", reply)
-            await maybe_summarize_with_gemini()
-            return reply.strip()
-
-        # prefixo: $ (GPT-5)
-        async def dev_handler2(user_text: str, wa_from: str) -> str:
-            import openai
-
-            client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
-            history = fetch_messages(20)
-            summary = latest_summary()
-
-            context = (
-                """
-                Você é um consultor agrícola especializado em produção e manejo de maçãs.
-                Seu papel é orientar produtores sobre plantio, irrigação, poda, controle de pragas, colheita e comercialização.
-                Responda de forma clara, prática e técnica, com foco em aumentar a produtividade e a qualidade das maçãs, reduzindo custos e impactos ambientais.
-                Dê dicas objetivas baseadas em boas práticas agrícolas e experiências reais no campo.
-                """.strip()
-            )
-            if summary:
-                context += f"Resumo: {summary}\n"
-            for rec in [r for r in history if r["role"] in ("user", "assistant")][-10:]:
-                context += f"{rec['role']}: {rec['content']}\n"
-            context += f"Usuário: {user_text}"
-
-            try:
-                res = await asyncio.to_thread(
-                    lambda: client.responses.create(
-                        model="gpt-5-2025-08-07",
-                        reasoning={"effort": "minimal"},
-                        instructions=context,
-                        input=user_text,
-                    )
-                )
-                reply = getattr(res, "output_text", "") or "Erro."
-            except Exception as e:
-                print({"type": "openai_exception", "error": str(e)})
-                reply = "Desculpe, ocorreu um erro ao processar sua solicitação."
-
-            save_message("user", user_text)
-            save_message("assistant", reply)
-            await maybe_summarize_with_gemini()
-            return reply.strip()
-
-        # prefixo: & (DeepSeek)
-        async def dev_handler3(user_text: str, wa_from: str) -> str:
-            from langchain_openai import ChatOpenAI
-            from langchain.schema import SystemMessage, HumanMessage, AIMessage
-
-            client = ChatOpenAI(
-                api_key=os.environ.get("DEEPSEEK_API_KEY"),
-                base_url="https://api.deepseek.com",
-                model="deepseek-chat",
-                temperature=0.3,
-                max_tokens=300,
-            )
-
-            history = fetch_messages(20)
-            summary = latest_summary()
-            msgs = [
-                SystemMessage(
-                    content=
-                    """
-                    Você é um consultor agrícola especializado em produção e manejo de maçãs.
-                    Seu papel é orientar produtores sobre plantio, irrigação, poda, controle de pragas, colheita e comercialização.
-                    Responda de forma clara, prática e técnica, com foco em aumentar a produtividade e a qualidade das maçãs, reduzindo custos e impactos ambientais.
-                    Dê dicas objetivas baseadas em boas práticas agrícolas e experiências reais no campo.
-                    """.strip()
-                )
-            ]
-            if summary:
-                msgs.append(SystemMessage(content=f"Resumo: {summary}"))
-            for rec in [r for r in history if r["role"] in ("user", "assistant")][-10:]:
-                if rec["role"] == "user":
-                    msgs.append(HumanMessage(content=rec["content"]))
-                else:
-                    msgs.append(AIMessage(content=rec["content"]))
-            msgs.append(HumanMessage(content=user_text))
-
-            try:
-                res = await asyncio.to_thread(client.invoke, msgs)
-                reply = getattr(res, "content", "") or str(res)
-            except Exception as e:
-                print({"type": "deepseek_exception", "error": str(e)})
-                reply = "Desculpe, ocorreu um erro ao processar sua solicitação."
-
-            save_message("user", user_text)
-            save_message("assistant", reply)
-            await maybe_summarize_with_gemini()
-            return reply.strip()
-
-        # ===========================================
-        # Seleção do LLM
-        # ===========================================
-        text = (msg.get("text") or {}).get("body", "").strip()
-        st = get_state(wa_from)
-        
-        if text and st.get("stage") != "ready":
-            if st.get("stage") == "choose_mode" and st.get("llm"):
-                await send_mode_menu()
-                return {"status": "need_mode"}
-            await send_llm_menu()
-            return {"status": "need_llm"}
-        
-        prefix = text[:1] if text else ""
-        user_text = text[1:].lstrip() if len(text) > 1 else text
-        
-        match prefix:
-            case "@":
-                reply_text = await dev_handler1(user_text, wa_from)
-            case "$":
-                reply_text = await dev_handler2(user_text, wa_from)
-            case "&":
-                reply_text = await dev_handler3(user_text, wa_from)
-            case _:
-                st = get_state(wa_from)
-                llm = st.get("llm")
-                # mode = st.get("mode")
-                
-                match llm:
-                    case "gemini":
-                        reply_text = await dev_handler1(user_text, wa_from)
-                    case "gpt":
-                        reply_text = await dev_handler2(user_text, wa_from)
-                    case "deepseek":
-                        reply_text = await dev_handler3(user_text, wa_from)
-                    case _:
-                        await send_llm_menu()
-                        return {"status": "need_llm_again"}
-
-        if C["DRY_RUN"]:
-            print({"type": "wa_outbound_dry_run", "to": wa_from, "text": reply_text[:4096]})
-            return {"status": "dry_ok"}
-
-        # limpa markdown
-        reply_text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", reply_text)
-        reply_text = re.sub(r"[`*_~#>]", "", reply_text).strip()
-        if len(reply_text) > 4096:
-            reply_text = reply_text[:4095] + "…"
-
-        # pausa typing
-        try:
-            async with httpx.AsyncClient(timeout=10) as fb2:
-                await fb2.post(
-                    wa_api_url,
-                    headers=headers,
-                    json={
-                        "messaging_product": "whatsapp",
-                        "to": wa_from,
-                        "type": "typing",
-                        "typing": {"status": "paused"},
-                    },
-                )
-        except Exception as e:
-            print({"type": "wa_feedback_err_pause", "error": str(e)})
-
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": wa_from,
-            "type": "text",
-            "text": {"body": reply_text},
-        }
+        log("wa_inbound_message", from_=wa_from, msg_type=wa_type)
 
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(wa_api_url, json=payload, headers=headers)
+            if wa_type == "interactive":
+                return await handle_interactive(client, api_url, headers, wa_from, msg)
 
-        print({"type": "wa_outbound_resp", "status": resp.status_code, "body": resp.text[:4000]})
-        return {"status": "sent" if resp.is_success else "error", "code": resp.status_code}
+            if wa_type == "text":
+                text = extract_text(msg)
+                if not text:
+                    return {"status": "ok"}
+                return await handle_text_message(client, C, api_url, headers, wa_from, wamid, text)
+
+            log("wa_inbound_skip", reason="unsupported_type", wa_type=wa_type)
+            return {"status": "ok"}
 
     except Exception as e:
-        print({"type": "wa_exception", "error": str(e)})
+        log("wa_exception", error=str(e))
         return {"status": "exception"}
 
 
