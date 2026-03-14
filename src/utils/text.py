@@ -12,8 +12,4 @@ _MD_GARBAGE_RE = re.compile(r"[`*_~#>]")
 def clean_reply_text(text: str) -> str:
     text = _MD_LINK_RE.sub(r"\1", text or "")
     text = _MD_GARBAGE_RE.sub("", text).strip()
-
-    if len(text) > MAX_WA_TEXT:
-        text = text[: MAX_WA_TEXT - 1] + "…"
-
     return text
