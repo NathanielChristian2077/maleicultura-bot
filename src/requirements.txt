@@ -5,8 +5,3 @@ boto3
 botocore
 python-dotenv
 openai
-
-langchain>=0.3.7,<0.4
-langchain-core>=0.3.15,<0.4
-langchain-openai>=0.2.5,<0.3
-langchain-google-genai>=2.0.0,<3
