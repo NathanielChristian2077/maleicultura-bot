@@ -3,6 +3,8 @@ import time
 import traceback
 
 from config import GPT5_RAG_MODEL, env
+from rag.prompt import build_rag_input
+from rag.store import retrieve_documents
 from services.memory import (
     build_context_block,
     maybe_summarize_with_gpt5_rag,
@@ -81,12 +83,21 @@ async def handler_gpt5_rag(wa_from: str, user_text: str) -> str:
     instructions = _build_instruction_context(wa_from)
 
     try:
+        docs = await retrieve_documents(user_text)
+        rag_input = build_rag_input(user_text, docs)
+        log(
+            "rag_prompt_built",
+            wa_from=wa_from,
+            docs=len(docs),
+            input_chars=len(rag_input),
+        )
+
         res = await asyncio.to_thread(
             lambda: client.responses.create(
                 model=GPT5_RAG_MODEL,
                 reasoning={"effort": "minimal"},
                 instructions=instructions,
-                input=user_text,
+                input=rag_input,
                 max_output_tokens=500,
             )
         )

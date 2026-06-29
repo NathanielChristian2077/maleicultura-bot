@@ -49,9 +49,39 @@ O template utiliza os seguintes parâmetros no AWS Systems Manager Parameter Sto
 - `/maleicultura/phone_number_id`
 - `/maleicultura/openai_api_key`
 
-O identificador do modelo é definido pela variável `GPT5_RAG_MODEL` no `template.yaml`. A implementação da recuperação documental pode acrescentar os parâmetros próprios de RAG quando for integrada.
+O identificador do modelo é definido pela variável `GPT5_RAG_MODEL` no `template.yaml`.
 
-## 4. Deploy
+## 4. RAG documental
+
+Esta branch usa apenas o fluxo GPT-5-RAG. O corpus de chunks fica em `data/chunks_out.jsonl`, importado do projeto `simple-rag-agents`. Gemini, DeepSeek e a pipeline de CSV do projeto original não são usados pelo bot.
+
+As principais variáveis de RAG são configuradas em `template.yaml`:
+
+- `RAG_EMBED_MODEL`: modelo de embeddings da OpenAI, por padrão `text-embedding-3-small`
+- `RAG_CHROMA_COLLECTION`: coleção do Chroma, por padrão `chunks`
+- `RAG_CHROMA_PATH`: caminho do banco Chroma dentro do pacote Lambda, por padrão `chroma_db`
+- `RAG_TOP_K`: quantidade de trechos recuperados por pergunta, por padrão `5`
+
+Antes de empacotar/deployar, gere o banco vetorial localmente. O comando abaixo lê `data/chunks_out.jsonl` e cria `src/chroma_db`:
+
+```bash
+pip install -r src/requirements.txt
+cd src
+python -m rag.ingest create
+cd ..
+```
+
+Para acrescentar novos chunks sem recriar tudo:
+
+```bash
+cd src
+python -m rag.ingest append
+cd ..
+```
+
+O diretório `src/chroma_db` é ignorado pelo Git para evitar versionar artefatos grandes, mas deve existir localmente antes de `sam build` caso o banco seja empacotado junto da Lambda. Se `RAG_CHROMA_PATH` apontar para outro local, como uma Layer montada em `/opt`, ajuste a variável no template ou no ambiente de deploy.
+
+## 5. Deploy
 
 ```bash
 sam build
