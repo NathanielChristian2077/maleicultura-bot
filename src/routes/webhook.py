@@ -1,15 +1,13 @@
 import json
 
-import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse, Response
 
 from config import cfg
-from utils.logging import log
 from services.state import seen_before
-from services.flow import handle_interactive, handle_text_message
-from whatsapp.parser import extract_value, extract_message, extract_text
-from whatsapp.sender import wa_api_url, wa_headers
+from services.worker_dispatch import dispatch_worker
+from utils.logging import log
+from whatsapp.parser import extract_message, extract_text, extract_value
 
 
 router = APIRouter()
@@ -42,9 +40,6 @@ async def incoming(request: Request):
             token=bool(C.get("WABA_TOKEN")),
         )
         return {"status": "ok", "warning": "missing_config"}
-
-    api_url = wa_api_url(C)
-    headers = wa_headers(C)
 
     try:
         raw = await request.body()
@@ -94,35 +89,57 @@ async def incoming(request: Request):
 
         log("wa_inbound_message", from_=wa_from, msg_type=wa_type)
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            if wa_type in ("interactive", "button"):
-                return await handle_interactive(
-                    client,
-                    api_url,
-                    headers,
-                    wa_from,
-                    wamid,
-                    msg,
-                )
+        if wa_type in ("interactive", "button"):
+            ok = dispatch_worker(
+                {
+                    "kind": "interactive",
+                    "wa_from": wa_from,
+                    "wamid": wamid,
+                    "msg": msg,
+                }
+            )
 
-            if wa_type == "text":
-                text = extract_text(msg)
-                if not text:
-                    return {"status": "ok"}
+            log(
+                "wa_worker_queue_result",
+                kind="interactive",
+                wa_from=wa_from,
+                wamid=wamid,
+                queued=ok,
+            )
 
-                return await handle_text_message(
-                    client,
-                    C,
-                    api_url,
-                    headers,
-                    wa_from,
-                    wamid,
-                    text,
-                )
+            # Mesmo se dispatch falhar, responde 200 para evitar retry infinito da Meta.
+            return {"status": "queued" if ok else "dispatch_failed"}
 
-            log("wa_inbound_skip", reason="unsupported_type", wa_type=wa_type)
-            return {"status": "ok"}
+        if wa_type == "text":
+            text = extract_text(msg)
+            if not text:
+                log("wa_inbound_skip", reason="empty_text", wa_from=wa_from)
+                return {"status": "ok"}
+
+            ok = dispatch_worker(
+                {
+                    "kind": "text",
+                    "wa_from": wa_from,
+                    "wamid": wamid,
+                    "msg": msg,
+                    "text": text,
+                }
+            )
+
+            log(
+                "wa_worker_queue_result",
+                kind="text",
+                wa_from=wa_from,
+                wamid=wamid,
+                queued=ok,
+            )
+
+            # Mesmo se dispatch falhar, responde 200 para evitar retry infinito da Meta.
+            return {"status": "queued" if ok else "dispatch_failed"}
+
+        log("wa_inbound_skip", reason="unsupported_type", wa_type=wa_type)
+        return {"status": "ok"}
 
     except Exception as e:
-        log("wa_exception", error=str(e))
+        log("wa_exception", error_type=type(e).__name__, error=str(e))
         return {"status": "exception"}

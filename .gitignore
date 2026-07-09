@@ -11,4 +11,7 @@ __pycache__/
 venv/
 .env
 
+# RAG artifacts
+src/chroma_db/
+
 .vscode/
