@@ -98,7 +98,7 @@ async def handler_gpt5_rag(wa_from: str, user_text: str) -> str:
                 reasoning={"effort": "minimal"},
                 instructions=instructions,
                 input=rag_input,
-                max_output_tokens=500,
+                max_output_tokens=350,
             )
         )
         reply = getattr(res, "output_text", "") or ""

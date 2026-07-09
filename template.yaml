@@ -2,55 +2,110 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: Maleicultura - FastAPI on Lambda + HTTP API
 
-Globals:
-  Function:
-    Runtime: python3.12
-    Timeout: 60
-    MemorySize: 512
-    Architectures:
-      - x86_64
-    Environment:
-      Variables:
-        GRAPH_API_VERSION: v24.0
-        WHATSAPP_VERIFY_TOKEN: '{{resolve:ssm:/maleicultura/whatsapp_verify_token}}'
-        WHATSAPP_TOKEN: '{{resolve:ssm:/maleicultura/whatsapp_token}}'
-        WHATSAPP_PHONE_NUMBER_ID: '{{resolve:ssm:/maleicultura/phone_number_id}}'
-        OPENAI_API_KEY: '{{resolve:ssm:/maleicultura/openai_api_key}}'
-        GPT5_RAG_MODEL: gpt-5-2025-08-07
-        RAG_EMBED_MODEL: text-embedding-3-small
-        RAG_CHROMA_COLLECTION: chunks
-        RAG_CHROMA_PATH: chroma_db
-        RAG_TOP_K: "5"
-        CONV_TABLE: conversations
-        CONV_TOKEN_LIMIT: "2000"
-        CONV_TTL_DAYS: "7"
-        DEDUP_TTL_SEC: "600"
-
 Resources:
   ApiFunction:
     Type: AWS::Serverless::Function
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: src/
+      DockerTag: gpt5-rag-api
     Properties:
-      CodeUri: src/
-      Handler: app.handler
+      PackageType: Image
+      Timeout: 30
+      MemorySize: 512
+      EphemeralStorage:
+        Size: 1024
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          GRAPH_API_VERSION: v24.0
+          WHATSAPP_VERIFY_TOKEN: '{{resolve:ssm:/maleicultura/whatsapp_verify_token}}'
+          WHATSAPP_TOKEN: '{{resolve:ssm:/maleicultura/whatsapp_token}}'
+          WHATSAPP_PHONE_NUMBER_ID: '{{resolve:ssm:/maleicultura/phone_number_id}}'
+          OPENAI_API_KEY: '{{resolve:ssm:/maleicultura/openai_api_key}}'
+          GPT5_RAG_MODEL: gpt-5-2025-08-07
+          RAG_EMBED_MODEL: text-embedding-3-small
+          RAG_CHROMA_COLLECTION: chunks
+          RAG_CHROMA_PATH: chroma_db
+          RAG_TOP_K: "3"
+          CONV_TABLE: conversations
+          CONV_TOKEN_LIMIT: "2000"
+          CONV_TTL_DAYS: "7"
+          DEDUP_TTL_SEC: "600"
+          WORKER_FUNCTION_NAME: !Ref WorkerFunction
       Policies:
         - AWSLambdaBasicExecutionRole
         - Statement:
-          - Effect: Allow
-            Action:
-              - dynamodb:PutItem
-              - dynamodb:Query
-              - dynamodb:DescribeTable
-              - dynamodb:DeleteItem
-              - dynamodb:Scan
-              - dynamodb:UpdateItem
-            Resource:
-              - !GetAtt ConversationsTable.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:Query
+                - dynamodb:DescribeTable
+                - dynamodb:DeleteItem
+                - dynamodb:Scan
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt ConversationsTable.Arn
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource:
+                - !GetAtt WorkerFunction.Arn
       Events:
         Proxy:
           Type: HttpApi
           Properties:
             Path: /{proxy+}
             Method: ANY
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: src/
+      DockerTag: gpt5-rag-worker
+    Properties:
+      PackageType: Image
+      ImageConfig:
+        Command:
+          - worker.handler
+      Timeout: 180
+      MemorySize: 1536
+      EphemeralStorage:
+        Size: 2048
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          GRAPH_API_VERSION: v24.0
+          WHATSAPP_VERIFY_TOKEN: '{{resolve:ssm:/maleicultura/whatsapp_verify_token}}'
+          WHATSAPP_TOKEN: '{{resolve:ssm:/maleicultura/whatsapp_token}}'
+          WHATSAPP_PHONE_NUMBER_ID: '{{resolve:ssm:/maleicultura/phone_number_id}}'
+          OPENAI_API_KEY: '{{resolve:ssm:/maleicultura/openai_api_key}}'
+          GPT5_RAG_MODEL: gpt-5-2025-08-07
+          RAG_EMBED_MODEL: text-embedding-3-small
+          RAG_CHROMA_COLLECTION: chunks
+          RAG_CHROMA_PATH: chroma_db
+          RAG_TOP_K: "3"
+          CONV_TABLE: conversations
+          CONV_TOKEN_LIMIT: "2000"
+          CONV_TTL_DAYS: "7"
+          DEDUP_TTL_SEC: "600"
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:Query
+                - dynamodb:DescribeTable
+                - dynamodb:DeleteItem
+                - dynamodb:Scan
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt ConversationsTable.Arn
+
   ConversationsTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -74,3 +129,11 @@ Outputs:
   ApiEndpoint:
     Description: Endpoint HTTP público
     Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+
+  ApiFunctionName:
+    Description: Nome físico da Lambda do webhook
+    Value: !Ref ApiFunction
+
+  WorkerFunctionName:
+    Description: Nome físico da Lambda worker assíncrona
+    Value: !Ref WorkerFunction
