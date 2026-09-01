@@ -6,6 +6,8 @@ from mangum import Mangum
 
 import boto3
 from botocore.config import Config
+import asyncio
+import re
 
 app = FastAPI()
 _lambda = boto3.client("lambda", config=Config(retries={"max_attempts": 2}))
@@ -87,7 +89,7 @@ async def incoming(request: Request):
         #   No README.md eu detalho melhor como fazer o deploy, é fácil, mas o ideal é fazer os comandos pelo Linux (ou wsl), na verdade eu não tenho ideia de como funciona direto no Windows.
         
         # prefixo: @
-        async def dev_handler1(user_text:str, wa_from: str, C: dict) -> str:
+        async def dev_handler1(user_text:str, wa_from: str) -> str:
             from langchain_google_genai import ChatGoogleGenerativeAI
             from langchain.prompts import ChatPromptTemplate
 
@@ -114,54 +116,56 @@ async def incoming(request: Request):
                 ("user", "{user}")
             ])
 
-            chain = llm | prompt
+            chain = prompt | llm
 
-            response = chain.invoke({"user":user_text})
+            response = await asyncio.to_thread(chain.invoke, {"user":user_text})
 
-            return response['text']
+            try:
+                return response['text']
+            except Exception:
+                return (getattr(response, "content", None) or str(response) or "").strip()
     
         # prefixo: $
-        async def dev_handler2(user_text:str, wa_from: str, C: dict) -> str:
+        async def dev_handler2(user_text:str, wa_from: str) -> str:
             import openai
-            # Conferir e setar a chave da API depois
+            
             client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
             try:
-                response = client.chat.completions.create(
-                    model="gpt-5",
-                    messages=[
-                        {"role": "system", "content": "Você é um assistente de maleicultores brasileiros extremamente prestativo e objetivo que fala apenas em português."},
-                        {"role": "user", "content": user_text}
-                    ],
-                    temperature=0.3,
-                    max_tokens=300, 
+                response = await asyncio.to_thread(
+                    lambda: client.responses.create(
+                        model="gpt-5-2025-08-07",
+                        reasoning={"effort":"minimal"},
+                        instructions="Você é um assistente de maleicultores brasileiros extremamente prestativo e objetivo que fala apenas em português.",
+                        input=user_text 
+                    )
                 )
-                assistant_message = response.choices[0].message.content
+                assistant_message = response.output_text
+                
                 return assistant_message.strip() if assistant_message is not None else "Desculpe, ocorreu um erro ao processar sua solicitação."
             except Exception as e:
                 print({"type":"openai_exception", "error": str(e)})
                 return "Desculpe, ocorreu um erro ao processar sua solicitação."
     
         # prefixo: &
-        async def dev_handler3(user_text:str, wa_from: str, C: dict) -> str:
-            #TODO: Integrar LLM (Nathaniel)
+        async def dev_handler3(user_text:str, wa_from: str) -> str:
             import openai
-            from langchain import memorys
-            from langchain.chains import ConversationChain
+
             client = openai.OpenAI(
                 api_key=os.environ.get('DEEPSEEK_API_KEY'),
                 base_url="https://api.deepseek.com"
             )
-            response = client.chat.completions.create(
-                model="deepseek-v3.1",
-                messages=[
-                    {"role": "system", "content": "Você é um assistente de maleicultores brasileiros extremamente prestativo e objetivo que fala apenas em português."},
-                    {"role": "user", "content": user_text}
-                ],
-                temperature=0.3,
-                # 300 tokens = +/- 300/0.3 = 1000 palavras, na prática seria um pouco mais, mas considerando apenas testes...
-                max_tokens=300, # Ajustar para 500 {500/0.27 = 1851 palavras} em produção.
-                max_retries=2,
-                request_timeout=15
+            
+            response = await asyncio.to_thread(
+                lambda: client.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=[
+                        {"role": "system", "content": "Você é um assistente de maleicultores brasileiros extremamente prestativo e objetivo que fala apenas em português."},
+                        {"role": "user", "content": user_text}
+                    ],
+                    temperature=0.3,
+                    # 300 tokens = +/- 300/0.3 = 1000 palavras, na prática seria um pouco mais, mas considerando apenas testes...
+                    max_tokens=300, # Ajustar para 500 {500/0.27 = 1851 palavras} em produção.
+                )
             )
             return response.choices[0].message.content.strip()
         
@@ -173,11 +177,11 @@ async def incoming(request: Request):
         user_text = text[1:].lstrip() if len(text) > 1 else ""
         match prefix:
             case "@":
-                reply_text = await dev_handler1(user_text=user_text, wa_from=wa_from, C=C)
+                reply_text = await dev_handler1(user_text=user_text, wa_from=wa_from)
             case "$":
-                reply_text = await dev_handler2(user_text=user_text, wa_from=wa_from, C=C)
+                reply_text = await dev_handler2(user_text=user_text, wa_from=wa_from)
             case "&":
-                reply_text = await dev_handler3(user_text=user_text, wa_from=wa_from, C=C)
+                reply_text = await dev_handler3(user_text=user_text, wa_from=wa_from)
             case _:
                 reply_text = (
                     "Prefixo de mensagem não definido, por favor use:\n"
@@ -191,11 +195,19 @@ async def incoming(request: Request):
             return {"status": "dry_ok"}
 
         url = f"https://graph.facebook.com/{C['GRAPH_VERSION']}/{C['PHONE_NUMBER_ID']}/messages"
+
+        reply_text = (reply_text or "Parece que algo deu errado, tente novamente por gentileza.")
+        reply_text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", reply_text)
+        reply_text = re.sub(r"[`*_~#>]", "", reply_text)
+        reply_text = reply_text.strip()
+        if len(reply_text) > 4096:
+            reply_text = reply_text[:4095] + "…"
+
         payload = {
             "messaging_product": "whatsapp",
             "to": wa_from,
             "type": "text",
-            "text": {"body": str(reply_text)[:4096]}, # o limite do whatsapp é 4096
+            "text": {"body": reply_text}, # o limite do whatsapp é 4096
         }
         token = (C["WABA_TOKEN"] or "")
         token = token.replace("\r", "").replace("\n", "").strip().strip('"').strip("'")
