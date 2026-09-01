@@ -1,26 +1,40 @@
 import os
 
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_app_path(name: str, default: str) -> str:
+    raw = os.getenv(name, default)
+    if os.path.isabs(raw):
+        return raw
+    return os.path.abspath(os.path.join(APP_DIR, raw))
+
+
+def _int_env(name: str, default: str) -> int:
+    return int(os.getenv(name, default))
+
+
 SYSTEM_PROMPT = """
-Você é um consultor agrícola especializado em produção e manejo de maçãs.
-Seu papel é orientar produtores sobre plantio, irrigação, poda, controle de pragas,
-colheita e comercialização.
+Você é um consultor agrícola especializado em produção e manejo de maçãs,
+com foco em ajudar produtores rurais da região sul do Brasil.
 
-Responda de forma clara, prática e técnica, com foco em aumentar a produtividade
-e a qualidade das maçãs, reduzindo custos e impactos ambientais.
+Você responde pelo fluxo GPT-5-RAG. Use o contexto documental recuperado como
+fonte principal da resposta quando ele estiver disponível e for relevante.
 
-Dê dicas objetivas baseadas em boas práticas agrícolas e experiências reais no campo.
+Se o contexto recuperado estiver vazio ou insuficiente, diga claramente que não
+encontrou informação suficiente na base documental para responder com segurança.
+Não invente fontes, números, recomendações técnicas ou nomes de produtos.
+
+Responda de forma clara, prática e técnica, em um único parágrafo, sem markdown
+ou formatação especial.
 """.strip()
 
 
 # ============================================================
-# WhatsApp limits / UI
+# WhatsApp limits
 # ============================================================
 
 MAX_WA_TEXT = 4096
-
-MENU_TITLE_MAX = 20
-MENU_ID_MAX = 256
-MENU_BODY_MAX = 1024
 
 
 # ============================================================
@@ -28,14 +42,28 @@ MENU_BODY_MAX = 1024
 # ============================================================
 
 GRAPH_DEFAULT_VERSION = os.getenv("GRAPH_API_VERSION", "v23.0")
+GPT5_RAG_MODEL = os.getenv("GPT5_RAG_MODEL", "gpt-5-2025-08-07")
+
+
+# ============================================================
+# RAG config
+# ============================================================
+
+RAG_EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "text-embedding-3-small")
+RAG_CHROMA_COLLECTION = os.getenv("RAG_CHROMA_COLLECTION", "chunks")
+RAG_CHROMA_PATH = _resolve_app_path("RAG_CHROMA_PATH", "chroma_db")
+RAG_JSONL_PATH = _resolve_app_path(
+    "RAG_JSONL_PATH",
+    os.path.join("..", "data", "chunks_out.jsonl"),
+)
+RAG_TOP_K = _int_env("RAG_TOP_K", "5")
 
 
 # ============================================================
 # TTLs
 # ============================================================
 
-DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "600"))
-STATE_TTL_SEC = int(os.getenv("STATE_TTL_SEC", "1800"))
+DEDUP_TTL_SEC = _int_env("DEDUP_TTL_SEC", "600")
 
 
 # ============================================================
@@ -43,8 +71,8 @@ STATE_TTL_SEC = int(os.getenv("STATE_TTL_SEC", "1800"))
 # ============================================================
 
 CONV_TABLE = os.getenv("CONV_TABLE", "conversations")
-CONV_TOKEN_LIMIT = int(os.getenv("CONV_TOKEN_LIMIT", "2000"))
-CONV_TTL_DAYS = int(os.getenv("CONV_TTL_DAYS", "7"))
+CONV_TOKEN_LIMIT = _int_env("CONV_TOKEN_LIMIT", "2000")
+CONV_TTL_DAYS = _int_env("CONV_TTL_DAYS", "7")
 
 
 # ============================================================
