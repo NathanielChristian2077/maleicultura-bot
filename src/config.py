@@ -30,7 +30,7 @@ MAX_WA_TEXT = 4096
 # API / Runtime config
 # ============================================================
 
-GRAPH_DEFAULT_VERSION = os.getenv("GRAPH_API_VERSION", "v23.0")
+GRAPH_DEFAULT_VERSION = os.getenv("GRAPH_API_VERSION", "v24.0")
 GPT5_RAG_MODEL = os.getenv("GPT5_RAG_MODEL", "gpt-5-2025-08-07")
 
 
@@ -45,7 +45,7 @@ RAG_JSONL_PATH = _resolve_app_path(
     "RAG_JSONL_PATH",
     os.path.join("..", "data", "chunks_out.jsonl"),
 )
-RAG_TOP_K = _int_env("RAG_TOP_K", "5")
+RAG_TOP_K = _int_env("RAG_TOP_K", "3")
 
 
 # ============================================================
@@ -60,7 +60,6 @@ DEDUP_TTL_SEC = _int_env("DEDUP_TTL_SEC", "600")
 # ============================================================
 
 CONV_TABLE = os.getenv("CONV_TABLE", "conversations")
-CONV_TOKEN_LIMIT = _int_env("CONV_TOKEN_LIMIT", "2000")
 CONV_TTL_DAYS = _int_env("CONV_TTL_DAYS", "7")
 
 
