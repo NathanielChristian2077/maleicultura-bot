@@ -28,6 +28,7 @@ MENU_BODY_MAX = 1024
 # ============================================================
 
 GRAPH_DEFAULT_VERSION = os.getenv("GRAPH_API_VERSION", "v23.0")
+GPT5_RAG_MODEL = os.getenv("GPT5_RAG_MODEL", "gpt-5-2025-08-07")
 
 
 # ============================================================
