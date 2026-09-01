@@ -14,10 +14,13 @@ def _int_env(name: str, default: str) -> int:
     return int(os.getenv(name, default))
 
 
+def _float_env(name: str, default: str) -> float:
+    return float(os.getenv(name, default))
+
+
 SYSTEM_PROMPT = """
 Você é um consultor agrícola especializado em produção e manejo de maçãs, com foco em ajudar produtores rurais, considerando o contexto produtivo da região sul do Brasil. Seu papel é orientar produtores sobre plantio, irrigação, poda, controle de pragas, colheita, comercialização e qualquer outro aspecto da produção de maçãs. Responda e forneça recomendações baseadas em práticas agrícolas comprovadas e adaptadas às condições dadas. Responda de forma clara, concisa, curta e prática, em único parágrafo com poucas frases de maneira simples e resumido, sem markdown ou outras formatações.
 """.strip()
-
 
 # ============================================================
 # WhatsApp limits
@@ -25,14 +28,13 @@ Você é um consultor agrícola especializado em produção e manejo de maçãs,
 
 MAX_WA_TEXT = 4096
 
-
 # ============================================================
 # API / Runtime config
 # ============================================================
 
 GRAPH_DEFAULT_VERSION = os.getenv("GRAPH_API_VERSION", "v24.0")
 GPT5_RAG_MODEL = os.getenv("GPT5_RAG_MODEL", "gpt-5-2025-08-07")
-
+GPT5_FAST_MODEL = os.getenv("GPT5_FAST_MODEL", "gpt-5-mini-2025-08-07")
 
 # ============================================================
 # RAG config
@@ -46,7 +48,9 @@ RAG_JSONL_PATH = _resolve_app_path(
     os.path.join("..", "data", "chunks_out.jsonl"),
 )
 RAG_TOP_K = _int_env("RAG_TOP_K", "3")
-
+RAG_DENSE_K = _int_env("RAG_DENSE_K", "12")
+RAG_LEXICAL_K = _int_env("RAG_LEXICAL_K", "12")
+RAG_MIN_RELEVANCE = _float_env("RAG_MIN_RELEVANCE", "0.18")
 
 # ============================================================
 # TTLs
@@ -54,14 +58,12 @@ RAG_TOP_K = _int_env("RAG_TOP_K", "3")
 
 DEDUP_TTL_SEC = _int_env("DEDUP_TTL_SEC", "600")
 
-
 # ============================================================
 # DynamoDB config
 # ============================================================
 
 CONV_TABLE = os.getenv("CONV_TABLE", "conversations")
 CONV_TTL_DAYS = _int_env("CONV_TTL_DAYS", "7")
-
 
 # ============================================================
 # Environment helpers
