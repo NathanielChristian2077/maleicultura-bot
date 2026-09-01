@@ -5,11 +5,7 @@ import httpx
 from services.llm import handler_gpt5_rag
 from utils.logging import log
 from utils.text import clean_reply_text
-from whatsapp.sender import (
-    wa_send_text,
-    wa_send_text_chunks,
-    wa_typing_and_read,
-)
+from whatsapp.sender import wa_send_text_chunks, wa_typing_and_read
 
 
 async def handle_interactive(
@@ -20,22 +16,8 @@ async def handle_interactive(
     wamid: Optional[str],
     msg: dict[str, Any],
 ) -> dict[str, Any]:
-    if wamid:
-        await wa_typing_and_read(client, api_url, headers, wamid)
-
     log("wa_interactive_obsolete", wa_from=wa_from, msg_type=msg.get("type", ""))
-    response = await wa_send_text(
-        client,
-        api_url,
-        headers,
-        wa_from,
-        "O bot agora utiliza GPT-5-RAG e responde diretamente às perguntas. Envie sua pergunta em texto.",
-    )
-
-    return {
-        "status": "interactive_obsolete" if response.is_success else "error",
-        "code": response.status_code,
-    }
+    return {"status": "interactive_obsolete"}
 
 
 async def handle_text_message(
