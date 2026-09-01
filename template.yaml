@@ -18,6 +18,9 @@ Globals:
         GEMINI_API_KEY: '{{resolve:ssm:/maleicultura/gemini_api_key}}'
         OPENAI_API_KEY: '{{resolve:ssm:/maleicultura/openai_api_key}}'
         DEEPSEEK_API_KEY: '{{resolve:ssm:/maleicultura/deepseek_api_key}}'
+        CONV_TABLE: conversations
+        CONV_TOKEN_LIMIT: "2000"
+        CONV_TTL_DAYS: "7"
 
 Resources:
   ApiFunction:
@@ -48,6 +51,9 @@ Resources:
           KeyType: HASH
         - AttributeName: ts        
           KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
 
 Outputs:
   ApiEndpoint:
