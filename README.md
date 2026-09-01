@@ -1,6 +1,6 @@
 # Maleicultura-bot
 
-Bot de atendimento no WhatsApp para orientação em maleicultura. O backend utiliza o fluxo GPT-5-RAG como única rota de geração de respostas.
+Bot de atendimento no WhatsApp para orientação em maleicultura. O backend utiliza um fluxo RAG adaptativo: mensagens sociais são respondidas sem LLM, perguntas técnicas comuns usam recuperação documental com modelo rápido e perguntas complexas podem usar o modelo principal.
 
 ## 1. Requisitos
 
@@ -50,28 +50,38 @@ O template utiliza os seguintes parâmetros no AWS Systems Manager Parameter Sto
 - `/maleicultura/phone_number_id`
 - `/maleicultura/openai_api_key`
 
-O identificador do modelo é definido pela variável `GPT5_RAG_MODEL` no `template.yaml`.
+Os identificadores dos modelos são definidos pelas variáveis `GPT5_RAG_MODEL` e `GPT5_FAST_MODEL` no `template.yaml`.
 
 ## 4. Prompt do sistema
 
 O prompt do sistema deve existir em uma única fonte: `SYSTEM_PROMPT` em `src/config.py`.
 
-Não adicione instruções comportamentais, prompts auxiliares ou cópias do prompt em outros módulos. O fluxo principal carrega o prompt por `services.memory.build_context_block()` e o envia como `instructions` em `services.llm.handler_gpt5_rag()`.
+Não adicione cópias do prompt em outros módulos. As regras específicas de grounding documental ficam em `src/rag/prompt.py`, enquanto a apresentação determinística das fontes fica em `src/rag/citations.py`.
 
-A sumarização automática de memória está desativada para evitar um segundo caminho de instrução para o modelo.
+A sumarização automática de memória permanece desativada. O histórico só é carregado para rotas que dependem do contexto anterior.
 
 ## 5. RAG documental
 
-Esta branch usa apenas o fluxo GPT-5-RAG. O corpus de chunks fica em `data/chunks_out.jsonl`, importado do projeto `simple-rag-agents`. Gemini, DeepSeek, menus interativos e a pipeline de CSV do projeto original não são usados pelo bot.
+O corpus de chunks fica em `data/chunks_out.jsonl`, importado do projeto `simple-rag-agents`. A ingestão limpa duplicações consecutivas de OCR, normaliza o texto, acrescenta contexto de documento/página e cria dois índices locais:
+
+- Chroma para recuperação vetorial;
+- SQLite FTS5 (`lexical.sqlite3`) para recuperação lexical.
+
+Em runtime, os candidatos dos dois mecanismos são fundidos e passam por um gate de relevância antes de os melhores trechos serem enviados ao modelo.
 
 As principais variáveis de RAG são configuradas em `template.yaml`:
 
-- `RAG_EMBED_MODEL`: modelo de embeddings da OpenAI, por padrão `text-embedding-3-small`
-- `RAG_CHROMA_COLLECTION`: coleção do Chroma, por padrão `chunks`
-- `RAG_CHROMA_PATH`: caminho do banco Chroma dentro da imagem Lambda, por padrão `chroma_db`
-- `RAG_TOP_K`: quantidade de trechos recuperados por pergunta, por padrão `3`
+- `RAG_EMBED_MODEL`: modelo de embeddings da OpenAI, por padrão `text-embedding-3-small`;
+- `RAG_CHROMA_COLLECTION`: coleção do Chroma, por padrão `chunks`;
+- `RAG_CHROMA_PATH`: diretório dos índices dentro da imagem worker, por padrão `chroma_db`;
+- `RAG_TOP_K`: quantidade final de trechos enviados ao modelo, por padrão `3`;
+- `RAG_DENSE_K`: candidatos da busca vetorial, por padrão `12`;
+- `RAG_LEXICAL_K`: candidatos da busca lexical, por padrão `12`;
+- `RAG_MIN_RELEVANCE`: limiar mínimo usado pelo gate de relevância, por padrão `0.18`.
 
-Antes de empacotar/deployar, gere o banco vetorial localmente. O comando abaixo lê `data/chunks_out.jsonl` e cria `src/chroma_db`:
+### Recriação obrigatória do índice
+
+Após mudanças em ingestão, metadados ou recuperação, recrie o banco antes do build. Esta etapa também gera `lexical.sqlite3`:
 
 ```bash
 pip install -r src/requirements.txt
@@ -88,20 +98,44 @@ python -m rag.ingest append
 cd ..
 ```
 
-O diretório `src/chroma_db` é ignorado pelo Git para evitar versionar artefatos grandes, mas deve existir localmente antes de `sam build`. A imagem Lambda empacota esse diretório e, em runtime, copia o banco para `/tmp/chroma_db`, pois o filesystem da imagem é somente leitura fora de `/tmp`.
+O diretório `src/chroma_db` é ignorado pelo Git, mas deve existir antes de `sam build`. Em runtime a worker copia esse diretório para `/tmp/chroma_db`, pois o filesystem da imagem é somente leitura fora de `/tmp`.
 
-## 6. Arquitetura em produção
+## 6. Fluxo adaptativo
 
-A aplicação usa duas Lambdas em imagem de container:
+O roteador em `src/services/router.py` classifica a mensagem antes de pagar pelo pipeline completo:
 
-- `ApiFunction`: recebe o webhook HTTP do WhatsApp, deduplica o `wamid`, despacha o trabalho para a worker e responde rapidamente para evitar retry da Meta.
-- `WorkerFunction`: executa o fluxo pesado GPT-5-RAG, mantém o indicador de digitação ativo enquanto processa e envia a resposta final pelo WhatsApp.
+- saudações e agradecimentos: resposta estática, sem DynamoDB, embedding ou LLM;
+- pergunta técnica direta: RAG com modelo rápido e orçamento curto de saída;
+- continuação curta: histórico recente é usado para enriquecer a consulta de recuperação;
+- pergunta complexa: histórico e modelo principal podem ser utilizados.
 
-O DynamoDB `conversations` armazena histórico de conversa e registros temporários de deduplicação.
+Respostas técnicas recebem fontes determinísticas ao final da mensagem. Se o modelo citar `[1]` ou `[2]`, apenas as fontes utilizadas são mostradas; se ele omitir os marcadores, o backend acrescenta os documentos recuperados para que a resposta nunca esconda a proveniência disponível.
 
-## 7. Deploy
+## 7. Arquitetura em produção
 
-Como o pacote com Chroma e dependências excede o limite de ZIP da Lambda, o deploy usa container image e ECR.
+A aplicação usa duas Lambdas em imagens separadas:
+
+- `ApiFunction`: imagem leve, sem OpenAI, LangChain ou Chroma; recebe o webhook, deduplica o `wamid`, despacha a worker e retorna rapidamente;
+- `WorkerFunction`: contém o pipeline RAG, o índice documental, mantém o indicador de digitação e envia a resposta final.
+
+O DynamoDB `conversations` armazena histórico e registros temporários de deduplicação. A resposta do WhatsApp é enviada antes da persistência do diálogo; usuário e assistente são gravados juntos com `BatchWriteItem` depois do envio bem-sucedido.
+
+## 8. Testes
+
+A suíte unitária não exige chamadas reais à OpenAI ou AWS:
+
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q src tests
+```
+
+Ela cobre roteamento adaptativo, reescrita de continuação, limpeza de corpus, índice FTS5, fusão dense/lexical, gate de relevância, fontes determinísticas, persistência em lote e separação das imagens de container.
+
+O workflow `.github/workflows/unit-tests.yml` executa a mesma validação em pushes da branch de implementação e em pull requests.
+
+## 9. Deploy
+
+As dependências da API e da worker são separadas em `src/requirements-api.txt` e `src/requirements-worker.txt`. O SAM usa `Dockerfile.api` e `Dockerfile.worker` respectivamente.
 
 ```bash
 sam build
@@ -113,7 +147,7 @@ sam deploy \
   --resolve-image-repos
 ```
 
-## 8. Logs
+## 10. Logs
 
 Para acompanhar a Lambda do webhook:
 
