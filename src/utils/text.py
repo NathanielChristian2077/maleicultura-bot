@@ -1,7 +1,5 @@
 import re
 
-from config import MAX_WA_TEXT
-
 
 # Regex
 # Remove markdowns do WhatsApp
