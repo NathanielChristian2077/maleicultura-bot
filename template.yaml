@@ -21,6 +21,8 @@ Globals:
         CONV_TABLE: conversations
         CONV_TOKEN_LIMIT: "2000"
         CONV_TTL_DAYS: "7"
+        DEDUP_TTL_SEC: "600"
+        STATE_TTL_SEC: "1800"
 
 Resources:
   ApiFunction:
