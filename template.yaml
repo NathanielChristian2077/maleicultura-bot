@@ -5,9 +5,10 @@ Description: Maleicultura - FastAPI on Lambda + HTTP API
 Globals:
   Function:
     Runtime: python3.12
-    Timeout: 10
+    Timeout: 15
     MemorySize: 256
-    Architectures: [x86_64]
+    Architectures:
+      - x86_64
     Environment:
       Variables:
         GRAPH_API_VERSION: v20.0
@@ -33,4 +34,4 @@ Resources:
 Outputs:
   ApiEndpoint:
     Description: Endpoint HTTP público
-    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+    Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com
