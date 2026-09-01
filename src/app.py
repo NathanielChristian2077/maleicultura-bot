@@ -106,7 +106,46 @@ async def incoming(request: Request):
             return {"status":"ok"}
 
         print({"type":"wa_inbound_message", "from": wa_from, "msg_type": wa_type})
+
+        url = f"https://graph.facebook.com/{C['GRAPH_VERSION']}/{C['PHONE_NUMBER_ID']}/message"
         
+        token = (C["WABA_TOKEN"] or "")
+        token = token.replace("\r", "").replace("\n", "").strip().strip('"').strip("'")
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        # Feedback imediato pro usuário
+        try:
+            async with httpx.AsyncClient(timeout = 10) as cliente_fb:
+                # Marca mensagem como lida
+                await cliente_fb.post(
+                    url,
+                    headers,
+                    json = {
+                        "messaging_product": "whatsapp",
+                        "status": "read",
+                        "message_id": wamid,
+                    },
+                )
+
+                # Faz a animação de typing na conversa e define o contato como typing na visualização das conversas
+                await cliente_fb.post(
+                    url,
+                    headers,
+                    json = {
+                       "messaging_product": "whatsapp",
+                       "to": wa_from,
+                       "type": "typing",
+                       "typing": {"status": "typing"}, 
+                    },
+                )
+        except Exception as e:
+            print({"type": "wa_feedback_err", "error": str(e)})
+
         #=============================================================================
         #               Handlers a serem usados para integrar as APIs
         #=============================================================================
@@ -190,8 +229,8 @@ async def incoming(request: Request):
                         {"role": "user", "content": user_text}
                     ],
                     temperature=0.3,
-                    # 300 tokens = +/- 300/0.3 = 1000 palavras, na prática seria um pouco mais, mas considerando apenas testes...
-                    max_tokens=300, # Ajustar para 500 {500/0.27 = 1851 palavras} em produção.
+                    # 300 tokens = +/- 300/0.3 = 1000 caracteres, na prática seria um pouco mais, mas considerando apenas testes...
+                    max_tokens=300, # Ajustar para 500 {500/0.27 = 1851 caracteres} em produção.
                 )
             )
             return response.choices[0].message.content.strip()
@@ -221,8 +260,6 @@ async def incoming(request: Request):
             print({"type":"wa_outbound_dry_run", "to": wa_from, "text": reply_text[:4096]})
             return {"status": "dry_ok"}
 
-        url = f"https://graph.facebook.com/{C['GRAPH_VERSION']}/{C['PHONE_NUMBER_ID']}/messages"
-
         reply_text = (reply_text or "Parece que algo deu errado, tente novamente por gentileza.")
         # O Fabricio relatou que tiveram casos onde as respostas dos llms estavam chagando com markdown, então fiz isso aqui pra limpar.
         # Não tenho certeza, mas acho que dá pra setar algum parâmetro em pra resposta vir como "plaintext", se encontrarem, adicionem pros merges futuros e me avisem
@@ -232,21 +269,29 @@ async def incoming(request: Request):
         if len(reply_text) > 4096:
             reply_text = reply_text[:4095] + "…"
 
+        # Interrompe o status: typing antes de enviar a resposta do LLM
+        try:
+           async with httpx.AsyncClient(timeout = 10) as client_fb2:
+               await client_fb2.post(
+                   url,
+                   headers,
+                   json = {
+                       "messaging_product": "whatsapp",
+                       "to": wa_from,
+                       "type": "typing",
+                       "typing": {"status": "paused"},
+                   },
+               ) 
+        except Exception as e:
+            print({"type": "wa_feedback_err_pause", "error": str(e)})
+
         payload = {
             "messaging_product": "whatsapp",
             "to": wa_from,
             "type": "text",
             "text": {"body": reply_text}, # o limite do whatsapp é 4096
         }
-        token = (C["WABA_TOKEN"] or "")
-        token = token.replace("\r", "").replace("\n", "").strip().strip('"').strip("'")
-
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-
+        
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(url, json=payload, headers=headers)
 
