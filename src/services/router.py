@@ -5,7 +5,6 @@ from typing import Any, Sequence
 
 _WORD_RE = re.compile(r"[\wÀ-ÿ]+", re.UNICODE)
 
-
 @dataclass(frozen=True)
 class RouteDecision:
     kind: str
@@ -13,142 +12,77 @@ class RouteDecision:
     include_history: bool
     model_tier: str
     max_output_tokens: int
-    static_reply: str | None = None
+    reasoning_effort: str = "minimal"
 
 
 def _normalize(text: str) -> str:
     value = unicodedata.normalize("NFKD", text or "")
     value = "".join(ch for ch in value if not unicodedata.combining(ch))
-    value = re.sub(r"\s+", " ", value).strip().lower()
-    return value
+    value = value.lower().replace("_", " ")
+    value = re.sub(r"[^\w\s]", " ", value, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def _words(text: str) -> list[str]:
     return _WORD_RE.findall(_normalize(text))
 
+_GREETING_EXACT = {"oi", "ola", "opa", "bom dia", "boa tarde", "boa noite", "e ai", "fala", "salve"}
+_THANKS = {"obrigado", "obrigada", "valeu", "muito obrigado", "muito obrigada", "agradecido", "agradecida"}
+_FOLLOWUP_PREFIXES = ("e para ", "e no ", "e na ", "e se ", "nesse caso", "neste caso", "e quanto a", "e quanto ao", "e essa", "e esse", "e isso", "essa ", "esse ", "isso", "tambem")
+_COMPLEX_MARKERS = ("compare", "comparar", "diferenca entre", "planejamento", "passo a passo", "vantagens e desvantagens", "causas e controle", "diagnostico diferencial")
+_APPLE_DOMAIN_TERMS = {"maca", "macas", "macieira", "macieiras", "maleicultura", "pomar", "pomares", "gala", "fuji", "eva", "galaxy", "maxi gala", "pink lady", "cripps pink", "grafolita", "grapholita", "bonagota", "lagarta enroladeira", "cydia", "sarna da macieira", "venturia", "marssonina", "bitter pit", "patulina", "mosca das frutas"}
 
-_GREETING = {
-    "oi",
-    "ola",
-    "bom dia",
-    "boa tarde",
-    "boa noite",
-    "e ai",
-}
 
-_THANKS = {
-    "obrigado",
-    "obrigada",
-    "valeu",
-    "muito obrigado",
-    "muito obrigada",
-    "agradecido",
-}
+def _contains_domain_term(normalized: str) -> bool:
+    padded = f" {normalized} "
+    return any(f" {term} " in padded for term in _APPLE_DOMAIN_TERMS)
 
-_FOLLOWUP_PREFIXES = (
-    "e para ",
-    "e no ",
-    "e na ",
-    "e se ",
-    "nesse caso",
-    "neste caso",
-    "e quanto a",
-    "e quanto ao",
-    "isso",
-    "essa ",
-    "esse ",
-    "tambem",
-)
 
-_COMPLEX_MARKERS = (
-    "compare",
-    "comparar",
-    "diferenca entre",
-    "diferença entre",
-    "planejamento",
-    "passo a passo",
-    "vantagens e desvantagens",
-    "causas e controle",
-    "diagnostico diferencial",
-    "diagnóstico diferencial",
-)
+def _looks_like_greeting(normalized: str, words: Sequence[str]) -> bool:
+    if normalized in _GREETING_EXACT:
+        return True
+    if not words or len(words) > 7:
+        return False
+    first = words[0]
+    if re.fullmatch(r"oi+e*", first) or re.fullmatch(r"ola+", first):
+        return True
+    return any(normalized.startswith(prefix) for prefix in ("bom dia", "boa tarde", "boa noite"))
 
 
 def route_message(text: str) -> RouteDecision:
     normalized = _normalize(text)
     words = _words(text)
-
-    if normalized in _GREETING:
-        return RouteDecision(
-            kind="social",
-            use_rag=False,
-            include_history=False,
-            model_tier="none",
-            max_output_tokens=0,
-            static_reply="Olá! Envie sua dúvida sobre produção ou manejo de maçãs.",
-        )
-
-    if normalized in _THANKS:
-        return RouteDecision(
-            kind="social",
-            use_rag=False,
-            include_history=False,
-            model_tier="none",
-            max_output_tokens=0,
-            static_reply="Disponha. Quando precisar, envie outra dúvida sobre o pomar.",
-        )
-
-    if len(words) <= 16 and normalized.startswith(_FOLLOWUP_PREFIXES):
-        return RouteDecision(
-            kind="followup",
-            use_rag=True,
-            include_history=True,
-            model_tier="fast",
-            max_output_tokens=180,
-        )
-
-    is_complex = (
-        len(words) >= 36
-        or text.count("?") >= 2
-        or any(marker in normalized for marker in _COMPLEX_MARKERS)
-    )
-    if is_complex:
-        return RouteDecision(
-            kind="complex",
-            use_rag=True,
-            include_history=True,
-            model_tier="full",
-            max_output_tokens=280,
-        )
-
-    return RouteDecision(
-        kind="technical",
-        use_rag=True,
-        include_history=False,
-        model_tier="fast",
-        max_output_tokens=140,
-    )
+    if len(words) <= 18 and normalized.startswith(_FOLLOWUP_PREFIXES):
+        return RouteDecision("followup", True, True, "full", 200, "minimal")
+    has_domain = _contains_domain_term(normalized)
+    is_complex = len(words) >= 36 or text.count("?") >= 2 or any(marker in normalized for marker in _COMPLEX_MARKERS)
+    if has_domain:
+        return RouteDecision("complex" if is_complex else "technical", True, is_complex, "full", 300 if is_complex else 180, "low" if is_complex else "minimal")
+    if _looks_like_greeting(normalized, words) or normalized in _THANKS:
+        return RouteDecision("social", False, False, "reception", 90, "minimal")
+    return RouteDecision("ambiguous", False, True, "reception", 120, "minimal")
 
 
-def build_retrieval_query(
-    current_text: str,
-    history: Sequence[dict[str, Any]],
-    decision: RouteDecision,
-) -> str:
+def decision_from_semantic_route(route: str) -> RouteDecision:
+    if route == "apple_technical":
+        return RouteDecision("technical", True, False, "full", 180)
+    if route == "apple_followup":
+        return RouteDecision("followup", True, True, "full", 200)
+    kind = route if route in {"social", "off_topic", "clarify"} else "clarify"
+    return RouteDecision(kind, False, kind == "clarify", "reception", 100)
+
+
+def build_retrieval_query(current_text: str, history: Sequence[dict[str, Any]], decision: RouteDecision) -> str:
     current = (current_text or "").strip()
     if not decision.include_history or not history:
         return current
-
     previous_user = ""
     for item in reversed(history):
         if item.get("role") == "user" and (item.get("content") or "").strip():
             previous_user = str(item["content"]).strip()
             break
-
     if not previous_user or previous_user == current:
         return current
-
     if decision.kind == "followup":
         return f"{previous_user}\nContinuação: {current}"
-
     return current
