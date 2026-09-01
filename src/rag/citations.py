@@ -20,6 +20,7 @@ def format_source(index: int, doc: Any) -> str:
     details: list[str] = []
     if source and source != label:
         details.append(source)
+    details.append(f"https://github.com/ProjetoChatMaca/documentos-maleicultura/blob/main/Articles/{source}")
     if page:
         details.append(f"p. {page}")
 
