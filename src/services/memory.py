@@ -1,11 +1,11 @@
-import time
 import asyncio
+import time
 from typing import Any, Optional
 
 import boto3
 from botocore.exceptions import ClientError
 
-from config import CONV_TABLE, CONV_TOKEN_LIMIT, CONV_TTL_DAYS, SYSTEM_PROMPT, env
+from config import CONV_TABLE, CONV_TOKEN_LIMIT, CONV_TTL_DAYS, GPT5_RAG_MODEL, SYSTEM_PROMPT, env
 from utils.logging import log
 
 
@@ -74,7 +74,7 @@ def latest_summary(wa_from: str, limit: int = 120) -> Optional[str]:
     return None
 
 
-async def maybe_summarize_with_gemini(wa_from: str) -> None:
+async def maybe_summarize_with_gpt5_rag(wa_from: str) -> None:
     history = fetch_messages(wa_from, 120)
     joined = "\n".join(f"{r['role']}: {r['content']}" for r in history)
     total = _approx_tokens(joined)
@@ -84,26 +84,26 @@ async def maybe_summarize_with_gemini(wa_from: str) -> None:
 
     log("token_limit_hit", wa_from=wa_from, tokens=total)
 
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    from langchain.schema import HumanMessage
+    from openai import OpenAI
 
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        google_api_key=env("GEMINI_API_KEY"),
-        convert_system_message_to_human=True,
-        temperature=0.3,
-        max_output_tokens=500,
-    )
-
-    prompt = (
-        "Resuma o diálogo a seguir de forma breve, mantendo informações importantes e contexto:\n\n"
-        + joined
+    client = OpenAI(api_key=env("OPENAI_API_KEY"))
+    instructions = (
+        "Resuma o diálogo recebido de forma breve, preservando o contexto e as "
+        "informações importantes para as próximas respostas."
     )
 
     try:
-        res = await asyncio.to_thread(llm.invoke, [HumanMessage(content=prompt)])
-        summary = getattr(res, "content", "") or str(res)
-        summary = (summary or "").strip()
+        res = await asyncio.to_thread(
+            lambda: client.responses.create(
+                model=GPT5_RAG_MODEL,
+                reasoning={"effort": "minimal"},
+                instructions=instructions,
+                input=joined,
+                max_output_tokens=500,
+            )
+        )
+        summary = getattr(res, "output_text", "") or ""
+        summary = summary.strip()
 
         if summary:
             save_message(wa_from, "system_summary", summary[:2000])
