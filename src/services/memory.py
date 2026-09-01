@@ -7,7 +7,6 @@ from botocore.exceptions import ClientError
 from config import CONV_TABLE, CONV_TTL_DAYS, SYSTEM_PROMPT
 from utils.logging import log
 
-
 _ddb = boto3.client("dynamodb")
 
 
@@ -16,24 +15,58 @@ def _ts_ms() -> int:
 
 
 def _ttl_epoch_seconds(days: int) -> int:
-    # DynamoDB TTL usa epoch em segundos.
     return int(time.time()) + days * 86400
+
+
+def _message_item(wa_from: str, ts: int, role: str, content: str) -> dict[str, Any]:
+    return {
+        "wa_from": {"S": wa_from},
+        "ts": {"N": str(ts)},
+        "role": {"S": role},
+        "content": {"S": content or ""},
+        "ttl": {"N": str(_ttl_epoch_seconds(CONV_TTL_DAYS))},
+    }
 
 
 def save_message(wa_from: str, role: str, content: str) -> None:
     try:
         _ddb.put_item(
             TableName=CONV_TABLE,
-            Item={
-                "wa_from": {"S": wa_from},
-                "ts": {"N": str(_ts_ms())},
-                "role": {"S": role},
-                "content": {"S": content or ""},
-                "ttl": {"N": str(_ttl_epoch_seconds(CONV_TTL_DAYS))},
-            },
+            Item=_message_item(wa_from, _ts_ms(), role, content),
         )
     except ClientError as e:
         log("ddb_put_err", error=str(e))
+
+
+def save_exchange(wa_from: str, user_text: str, assistant_text: str) -> None:
+    base_ts = _ts_ms()
+    try:
+        response = _ddb.batch_write_item(
+            RequestItems={
+                CONV_TABLE: [
+                    {
+                        "PutRequest": {
+                            "Item": _message_item(wa_from, base_ts, "user", user_text)
+                        }
+                    },
+                    {
+                        "PutRequest": {
+                            "Item": _message_item(
+                                wa_from,
+                                base_ts + 1,
+                                "assistant",
+                                assistant_text,
+                            )
+                        }
+                    },
+                ]
+            }
+        )
+        unprocessed = response.get("UnprocessedItems", {}).get(CONV_TABLE, [])
+        if unprocessed:
+            log("ddb_batch_unprocessed", count=len(unprocessed), wa_from=wa_from)
+    except ClientError as e:
+        log("ddb_batch_err", error=str(e), wa_from=wa_from)
 
 
 def fetch_messages(wa_from: str, limit: int = 50) -> list[dict[str, Any]]:
@@ -60,23 +93,10 @@ def fetch_messages(wa_from: str, limit: int = 50) -> list[dict[str, Any]]:
 
 
 def latest_summary(wa_from: str, limit: int = 120) -> Optional[str]:
-    """
-    Conversation summarization is intentionally disabled.
-
-    The production article and runtime behavior rely on a single system prompt,
-    defined in src/config.py as SYSTEM_PROMPT. Keeping summarization disabled
-    prevents an auxiliary model instruction from becoming a second prompt path.
-    """
     return None
 
 
 async def maybe_summarize_with_gpt5_rag(wa_from: str) -> None:
-    """
-    No-op by design.
-
-    Do not add model instructions here. The only system prompt used by the bot
-    must remain SYSTEM_PROMPT from src/config.py.
-    """
     return None
 
 
