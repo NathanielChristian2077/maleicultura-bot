@@ -15,7 +15,35 @@ _lambda = boto3.client("lambda", config=Config(retries={"max_attempts": 2}))
 
 _seen_wamids: dict[str, float] = {}
 _DEDUP_TTL_SEC = 600
+_user_state: dict[str, dict] = {}
+_STATE_TTL_SEC = 1800  # 30min, ajusta se quiser
 
+def _state_gc():
+    now = time.time()
+    expired = []
+    for k, st in _user_state.items():
+        ts = st.get("_ts", 0)
+        if now - ts > _STATE_TTL_SEC:
+            expired.append(k)
+    for k in expired:
+        _user_state.pop(k, None)
+
+def get_state(wa_from: str) -> dict:
+    _state_gc()
+    st = _user_state.get(wa_from)
+    if not st:
+        return {"stage": "choose_llm"}
+    return st
+
+def set_state(wa_from: str, **kwargs):
+    _state_gc()
+    st = _user_state.get(wa_from) or {}
+    st.update(kwargs)
+    st["_ts"] = time.time()
+    _user_state[wa_from] = st
+
+def reset_state(wa_from: str):
+    _user_state.pop(wa_from, None)
 
 def seen_bfr(wamid: str):
     now = time.time()
@@ -90,6 +118,63 @@ async def incoming(request: Request):
 
         msg = value["messages"][0]
         wa_type = msg.get("type")
+                
+        # Botões do menu
+        if wa_type == "interactive":
+            inter = msg.get("interactive") or {}
+
+            # reply buttons
+            br = inter.get("button_reply") or {}
+            button_id = br.get("id")
+            button_title = br.get("title")
+
+            print({"type": "wa_button_click", "from": wa_from, "id": button_id, "title": button_title})
+
+            st = get_state(wa_from)
+
+            if button_id in ("llm_gemini", "llm_gpt", "llm_deepseek"):
+                llm = {"llm_gemini": "gemini", "llm_gpt": "gpt", "llm_deepseek": "deepseek"}[button_id]
+                set_state(wa_from, stage="choose_mode", llm=llm)
+                await send_mode_menu()
+                return {"status": "ok_llm_selected"}
+
+            if button_id in ("mode_normal", "mode_rag", "mode_ft"):
+                mode = {"mode_normal": "normal", "mode_rag": "rag", "mode_ft": "finetune"}[button_id]
+                # por enquanto: só roteia para o mode normal
+                set_state(wa_from, stage="ready", mode=mode)
+
+                llm = (get_state(wa_from).get("llm") or "").upper()
+                await wa_send_interactive_buttons(
+                    wa_from,
+                    f"Fechado.\nLLM: {llm}\nModo: {mode}\n\nAgora manda tua pergunta.",
+                    [("menu_reset", "Trocar"), ("menu_keep", "Manter"), ("menu_help", "Ajuda")],
+                )
+                return {"status": "ok_mode_selected"}
+
+            if button_id == "menu_reset":
+                reset_state(wa_from)
+                await send_llm_menu()
+                return {"status": "ok_reset"}
+
+            if button_id == "menu_help":
+                await wa_send_interactive_buttons(
+                    wa_from,
+                    "Fluxo:\n1) Escolhe o LLM\n2) Escolhe o modo\n3) Manda a pergunta\n\nReset pra trocar tudo.",
+                    [("menu_reset", "Reset"), ("menu_keep", "Manter"), ("menu_help", "Ajuda")],
+                )
+                return {"status": "ok_help"}
+
+            # menu_keep ou qualquer coisa desconhecida
+            if button_id == "menu_keep":
+                return {"status": "ok_keep"}
+
+            await wa_send_interactive_buttons(
+                wa_from,
+                "Seleção inválida. Vamos de novo.",
+                [("menu_reset", "Reset"), ("menu_help", "Ajuda"), ("menu_keep", "Manter")],
+            )
+            return {"status": "ok_unknown_button"}
+
         wa_from = msg.get("from")
         is_echo = msg.get("from") == (value.get("metadata") or {}).get("display_phone_number")
         if is_echo:
@@ -138,6 +223,45 @@ async def incoming(request: Request):
                 )
         except Exception as e:
             print({"type": "wa_feedback_err", "error": str(e)})
+
+        # Menu para escolha de modelo
+        async def wa_send_interactive_buttons(to: str, body_text: str, buttons: list[tuple[str, str]]):
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "interactive",
+                "interactive": {
+                    "type": "button",
+                    "body": {"text": body_text[:1024]},
+                    "action": {
+                        "buttons": [
+                            {"type": "reply", "reply": {"id": bid[:256], "title": title[:20]}}
+                            for (bid, title) in buttons[:3]
+                        ]
+                    },
+                },
+            }
+
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(wa_api_url, json=payload, headers=headers)
+
+            print({"type": "wa_out_interactive", "status": resp.status_code, "body": resp.text[:2000]})
+            return resp
+        
+        async def send_llm_menu():
+            await wa_send_interactive_buttons(
+                wa_from,
+                "Escolha o modelo que vai responder:",
+                [("llm_gemini", "Gemini"), ("llm_gpt", "ChatGPT"), ("llm_deepseek", "DeepSeek")],
+            )
+
+        async def send_mode_menu():
+            await wa_send_interactive_buttons(
+                wa_from,
+                "Escolha o modo (por enquanto todos vão pro modo normal):",
+                [("mode_normal", "Normal"), ("mode_rag", "RAG"), ("mode_ft", "Fine-tuning")],
+            )
+
 
         # ===========================================
         #  MEMÓRIA DynamoDB e Resumo (Gemini)
@@ -378,10 +502,18 @@ async def incoming(request: Request):
         # Seleção do LLM
         # ===========================================
         text = (msg.get("text") or {}).get("body", "").strip()
-        if not text:
-            text = ""
-        prefix = text[:1]
-        user_text = text[1:].lstrip() if len(text) > 1 else ""
+        st = get_state(wa_from)
+        
+        if text and st.get("stage") != "ready":
+            if st.get("stage") == "choose_mode" and st.get("llm"):
+                await send_mode_menu()
+                return {"status": "need_mode"}
+            await send_llm_menu()
+            return {"status": "need_llm"}
+        
+        prefix = text[:1] if text else ""
+        user_text = text[1:].lstrip() if len(text) > 1 else text
+        
         match prefix:
             case "@":
                 reply_text = await dev_handler1(user_text, wa_from)
@@ -390,12 +522,20 @@ async def incoming(request: Request):
             case "&":
                 reply_text = await dev_handler3(user_text, wa_from)
             case _:
-                reply_text = (
-                    "Prefixo de mensagem não definido, por favor use:\n"
-                    "@ [texto] -> Fabricio\n"
-                    "$ [texto] -> Bruno\n"
-                    "& [texto] -> Nathaniel\n"
-                )
+                st = get_state(wa_from)
+                llm = st.get("llm")
+                # mode = st.get("mode")
+                
+                match llm:
+                    case "gemini":
+                        reply_text = await dev_handler1(user_text, wa_from)
+                    case "gpt":
+                        reply_text = await dev_handler2(user_text, wa_from)
+                    case "deepseek":
+                        reply_text = await dev_handler3(user_text, wa_from)
+                    case _:
+                        await send_llm_menu()
+                        return {"status": "need_llm_again"}
 
         if C["DRY_RUN"]:
             print({"type": "wa_outbound_dry_run", "to": wa_from, "text": reply_text[:4096]})
