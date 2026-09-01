@@ -17,6 +17,7 @@ def env(name: str, default: str = "") -> str:
         "WHATSAPP_PHONE_NUMBER_ID": ["PHONE_NUMBER_ID"],
         "GRAPH_API_VERSION": ["GRAPH_VERSION"],
         "DRY_RUN": [],
+        "GEMINI_API_KEY": [""]
     }
     val = os.getenv(name)
     if val is None:
@@ -88,8 +89,37 @@ async def incoming(request: Request):
         
         # prefixo: @
         async def dev_handler1(user_text:str, wa_from: str, C: dict) -> str:
-            #TODO: Integrar LLM (Fabricio)
-            return f"{user_text}"
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            from langchain.prompts import ChatPromptTemplate
+
+            llm = ChatGoogleGenerativeAI(
+                model= 'gemini-2.5-flash',
+                google_api_key= env("GEMINI_API_KEY"),
+                convert_system_message_to_human=True
+            )
+
+            prompt = ChatPromptTemplate.from_messages([
+                ("system","""
+                        Você é um consultor agrícola especializado em pomares de maçã, com foco em ajudar produtores rurais.
+                        Sua missão é explicar de forma simples, prática e acessível, evitando termos muito técnicos ou acadêmicos.
+
+                        Sempre que possível:
+                        - Dê exemplos reais de manejo.
+                        - Sugira passos práticos que o produtor possa aplicar no dia a dia.
+                        - Traga dicas sobre plantio, poda, irrigação, adubação, pragas, colheita e venda de maçãs.
+                        - Use uma linguagem de conversa amigável, como se estivesse no campo com o produtor.
+
+                        Se o usuário fizer perguntas fora da maleicultura, responda de forma breve e procure trazer o foco de volta para a cultura da maçã.
+                        O tom deve ser acolhedor e confiante, mostrando experiência, mas sem parecer complicado demais.
+                    """),
+                ("user", "{user}")
+            ])
+
+            chain = llm | prompt
+
+            response = chain.invoke({"user":user_text})
+
+            return response['text']
     
         # prefixo: $
         async def dev_handler2(user_text:str, wa_from: str, C: dict) -> str:
