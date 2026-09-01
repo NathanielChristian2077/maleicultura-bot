@@ -1,7 +1,10 @@
+import hashlib
 import json
 import os
+import re
 import sys
 import time
+import unicodedata
 from collections.abc import Iterable
 from typing import Any
 
@@ -12,6 +15,7 @@ from config import (
     RAG_JSONL_PATH,
     env,
 )
+from rag.lexical import initialize_lexical_index, upsert_lexical_documents
 
 
 def count_lines(path: str) -> int:
@@ -33,11 +37,14 @@ def ensure_db(mode: str, embeddings: Any) -> Any:
 
     if mode == "create":
         print("[ingest] Rebuilding vector DB from scratch...")
-        Chroma(
-            collection_name=RAG_CHROMA_COLLECTION,
-            persist_directory=RAG_CHROMA_PATH,
-            embedding_function=embeddings,
-        ).delete_collection()
+        try:
+            Chroma(
+                collection_name=RAG_CHROMA_COLLECTION,
+                persist_directory=RAG_CHROMA_PATH,
+                embedding_function=embeddings,
+            ).delete_collection()
+        except ValueError:
+            pass
     elif mode != "append":
         raise ValueError("mode must be 'create' or 'append'")
 
@@ -51,12 +58,53 @@ def ensure_db(mode: str, embeddings: Any) -> Any:
     )
 
 
+def clean_chunk_text(text: str) -> str:
+    value = unicodedata.normalize("NFKC", text or "").replace("\u00ad", "")
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+
+    cleaned_lines: list[str] = []
+    previous_nonempty = ""
+    blank_pending = False
+
+    for raw_line in value.split("\n"):
+        line = re.sub(r"[ \t]+", " ", raw_line).strip()
+        if not line:
+            blank_pending = bool(cleaned_lines)
+            continue
+
+        if line == previous_nonempty:
+            continue
+
+        if blank_pending and cleaned_lines and cleaned_lines[-1] != "":
+            cleaned_lines.append("")
+        cleaned_lines.append(line)
+        previous_nonempty = line
+        blank_pending = False
+
+    return "\n".join(cleaned_lines).strip()
+
+
+def _page_human(value: Any) -> Any:
+    if isinstance(value, int):
+        return value + 1
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip()) + 1
+    return value
+
+
+def _fallback_title(chunk: dict[str, Any]) -> str:
+    title = str(chunk.get("titulo") or "").strip()
+    if title:
+        return title
+    source = str(chunk.get("fonte") or chunk.get("doc_id") or "Documento").strip()
+    return re.sub(r"\.pdf$", "", source, flags=re.IGNORECASE)
+
+
 def _metadata_from_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
     for key in (
+        "chunk_id",
         "doc_id",
-        "titulo",
-        "pagina",
         "fonte",
         "path_pdf",
         "chunk_index",
@@ -65,7 +113,29 @@ def _metadata_from_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
         value = chunk.get(key)
         if value is not None:
             metadata[key] = value
+
+    metadata["titulo"] = _fallback_title(chunk)
+    if chunk.get("pagina") is not None:
+        metadata["pagina_indice"] = chunk.get("pagina")
+        metadata["pagina"] = _page_human(chunk.get("pagina"))
     return metadata
+
+
+def contextualize_chunk(text: str, metadata: dict[str, Any]) -> str:
+    header: list[str] = []
+    if metadata.get("titulo"):
+        header.append(f"Título: {metadata['titulo']}")
+    if metadata.get("fonte"):
+        header.append(f"Fonte: {metadata['fonte']}")
+    if metadata.get("pagina") not in (None, ""):
+        header.append(f"Página: {metadata['pagina']}")
+
+    return ("\n".join(header) + "\n\n" + text).strip() if header else text
+
+
+def _content_fingerprint(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def ingest(mode: str = "create", batch_size: int = 128) -> None:
@@ -85,12 +155,19 @@ def ingest(mode: str = "create", batch_size: int = 128) -> None:
 
     embeddings = OpenAIEmbeddings(model=RAG_EMBED_MODEL, api_key=env("OPENAI_API_KEY"))
     vectorstore = ensure_db(mode, embeddings)
+    lexical_conn = initialize_lexical_index(RAG_CHROMA_PATH, rebuild=mode == "create")
 
     existing_ids: set[str] = set()
+    seen_fingerprints: set[str] = set()
     if mode == "append":
-        print("[ingest] Loading existing chunk IDs for dedup...")
-        existing_docs = vectorstore.get(include=["metadatas"])
+        print("[ingest] Loading existing chunks for dedup...")
+        existing_docs = vectorstore.get(include=["documents"])
         existing_ids = set(existing_docs.get("ids") or [])
+        seen_fingerprints = {
+            _content_fingerprint(text)
+            for text in (existing_docs.get("documents") or [])
+            if text
+        }
         print(f"[ingest] Existing chunks: {len(existing_ids)}")
 
     total_lines = count_lines(RAG_JSONL_PATH)
@@ -102,37 +179,52 @@ def ingest(mode: str = "create", batch_size: int = 128) -> None:
     total_added = 0
     total_skipped = 0
 
-    for index, chunk in enumerate(load_jsonl_stream(RAG_JSONL_PATH), start=1):
-        chunk_id = str(chunk.get("chunk_id") or "").strip()
-        text = str(chunk.get("texto") or "").strip()
-
-        if not chunk_id or not text:
-            total_skipped += 1
-            continue
-
-        if chunk_id in existing_ids:
-            total_skipped += 1
-            continue
-
-        buffer_texts.append(text)
-        buffer_ids.append(chunk_id)
-        buffer_meta.append(_metadata_from_chunk(chunk))
-
-        if len(buffer_texts) >= batch_size:
-            vectorstore.add_texts(
-                texts=buffer_texts, ids=buffer_ids, metadatas=buffer_meta
-            )
-            total_added += len(buffer_texts)
-            buffer_texts.clear()
-            buffer_ids.clear()
-            buffer_meta.clear()
-            print(
-                f"[ingest] {index}/{total_lines} chunks processed; added={total_added}; skipped={total_skipped}"
-            )
-
-    if buffer_texts:
+    def flush() -> int:
+        if not buffer_texts:
+            return 0
         vectorstore.add_texts(texts=buffer_texts, ids=buffer_ids, metadatas=buffer_meta)
-        total_added += len(buffer_texts)
+        upsert_lexical_documents(
+            lexical_conn,
+            zip(buffer_ids, buffer_texts, buffer_meta),
+        )
+        count = len(buffer_texts)
+        buffer_texts.clear()
+        buffer_ids.clear()
+        buffer_meta.clear()
+        return count
+
+    try:
+        for index, chunk in enumerate(load_jsonl_stream(RAG_JSONL_PATH), start=1):
+            chunk_id = str(chunk.get("chunk_id") or "").strip()
+            clean_text = clean_chunk_text(str(chunk.get("texto") or ""))
+
+            if not chunk_id or not clean_text:
+                total_skipped += 1
+                continue
+
+            metadata = _metadata_from_chunk({**chunk, "chunk_id": chunk_id})
+            contextual_text = contextualize_chunk(clean_text, metadata)
+            fingerprint = _content_fingerprint(contextual_text)
+
+            if chunk_id in existing_ids or fingerprint in seen_fingerprints:
+                total_skipped += 1
+                continue
+
+            seen_fingerprints.add(fingerprint)
+            buffer_texts.append(contextual_text)
+            buffer_ids.append(chunk_id)
+            buffer_meta.append(metadata)
+
+            if len(buffer_texts) >= batch_size:
+                total_added += flush()
+                print(
+                    f"[ingest] {index}/{total_lines} chunks processed; "
+                    f"added={total_added}; skipped={total_skipped}"
+                )
+
+        total_added += flush()
+    finally:
+        lexical_conn.close()
 
     elapsed = time.time() - started_at
     print("[ingest] Completed.")
