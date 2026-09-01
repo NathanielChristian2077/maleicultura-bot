@@ -46,7 +46,7 @@ GRAPH_DEFAULT_VERSION = os.getenv("GRAPH_API_VERSION", "v23.0")
 _DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "600"))
 _STATE_TTL_SEC = int(os.getenv("STATE_TTL_SEC", "1800"))  # 30min
 
-# Dynamo (conversas) - "memória" 
+# Dynamo (conversas) - "memória"
 CONV_TABLE = os.getenv("CONV_TABLE", "conversations")
 CONV_TOKEN_LIMIT = int(os.getenv("CONV_TOKEN_LIMIT", "2000"))
 CONV_TTL_DAYS = int(os.getenv("CONV_TTL_DAYS", "7"))
@@ -60,6 +60,7 @@ _MD_GARBAGE_RE = re.compile(r"[`*_~#>]")
 # Logger simples (prints estruturados)
 # ============================================================
 
+
 def log(event: str, **fields: Any) -> None:
     print({"type": event, **fields})
 
@@ -67,6 +68,7 @@ def log(event: str, **fields: Any) -> None:
 # ============================================================
 # Env helpers / runtime config
 # ============================================================
+
 
 def env(name: str, default: str = "") -> str:
     fallback_map = {
@@ -185,6 +187,7 @@ def reset_state(wa_from: str) -> None:
 # Dynamo Conversation Memory + Summarization
 # ============================================================
 
+
 def _ts_ms() -> int:
     return int(time.time() * 1000)
 
@@ -228,7 +231,11 @@ def fetch_messages(wa_from: str, limit: int = 50) -> list[dict[str, Any]]:
         )
         items = list(reversed(resp.get("Items", [])))
         return [
-            {"ts": int(it["ts"]["N"]), "role": it["role"]["S"], "content": it["content"]["S"]}
+            {
+                "ts": int(it["ts"]["N"]),
+                "role": it["role"]["S"],
+                "content": it["content"]["S"],
+            }
             for it in items
         ]
     except ClientError as e:
@@ -263,7 +270,10 @@ async def maybe_summarize_with_gemini(wa_from: str) -> None:
         temperature=0.3,
         max_output_tokens=500,
     )
-    prompt = "Resuma o diálogo a seguir de forma breve, mantendo informações importantes e contexto:\n\n" + joined
+    prompt = (
+        "Resuma o diálogo a seguir de forma breve, mantendo informações importantes e contexto:\n\n"
+        + joined
+    )
 
     try:
         res = await asyncio.to_thread(llm.invoke, [HumanMessage(content=prompt)])
@@ -280,7 +290,10 @@ async def maybe_summarize_with_gemini(wa_from: str) -> None:
 # LLM Handlers (Gemini / GPT / DeepSeek)
 # ============================================================
 
-def build_context_block(wa_from: str, max_history: int = 20) -> tuple[str, list[dict[str, Any]], Optional[str]]:
+
+def build_context_block(
+    wa_from: str, max_history: int = 20
+) -> tuple[str, list[dict[str, Any]], Optional[str]]:
     history = fetch_messages(wa_from, max_history)
     summary = latest_summary(wa_from)
     return SYSTEM_PROMPT, history, summary
@@ -410,6 +423,7 @@ def route_llm(llm_key: str):
 # WhatsApp Send Helpers (text / interactive / feedback)
 # ============================================================
 
+
 def clean_reply_text(text: str) -> str:
     # Remove links markdown e alguns caracteres de formatação
     text = _MD_LINK_RE.sub(r"\1", text or "")
@@ -420,11 +434,7 @@ def clean_reply_text(text: str) -> str:
 
 
 async def wa_send_text(
-    client: httpx.AsyncClient,
-    api_url: str,
-    headers: dict[str, str],
-    to: str,
-    body: str
+    client: httpx.AsyncClient, api_url: str, headers: dict[str, str], to: str, body: str
 ) -> httpx.Response:
     payload = {
         "messaging_product": "whatsapp",
@@ -454,7 +464,13 @@ async def wa_send_interactive_buttons(
             "body": {"text": (body_text or "")[:MENU_BODY_MAX]},
             "action": {
                 "buttons": [
-                    {"type": "reply", "reply": {"id": bid[:MENU_ID_MAX], "title": title[:MENU_TITLE_MAX]}}
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": bid[:MENU_ID_MAX],
+                            "title": title[:MENU_TITLE_MAX],
+                        },
+                    }
                     for (bid, title) in buttons[:3]
                 ]
             },
@@ -466,16 +482,17 @@ async def wa_send_interactive_buttons(
 
 
 async def wa_mark_read(
-    client: httpx.AsyncClient,
-    api_url: str,
-    headers: dict[str, str],
-    wamid: str
+    client: httpx.AsyncClient, api_url: str, headers: dict[str, str], wamid: str
 ) -> None:
     try:
         await client.post(
             api_url,
             headers=headers,
-            json={"messaging_product": "whatsapp", "status": "read", "message_id": wamid},
+            json={
+                "messaging_product": "whatsapp",
+                "status": "read",
+                "message_id": wamid,
+            },
         )
     except Exception as e:
         log("wa_feedback_err_read", error=str(e))
@@ -486,23 +503,25 @@ async def wa_typing(
     api_url: str,
     headers: dict[str, str],
     to: str,
-    status: Literal["typing", "paused"]
+    status: Literal["typing", "paused"],
 ) -> None:
     try:
         await client.post(
             api_url,
             headers=headers,
-            json={"messaging_product": "whatsapp", "to": to, "type": "typing", "typing": {"status": status}},
+            json={
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "typing",
+                "typing": {"status": status},
+            },
         )
     except Exception as e:
         log("wa_feedback_err_typing", status=status, error=str(e))
 
 
 async def send_llm_menu(
-    client: httpx.AsyncClient,
-    api_url: str,
-    headers: dict[str, str],
-    wa_from: str
+    client: httpx.AsyncClient, api_url: str, headers: dict[str, str], wa_from: str
 ) -> None:
     await wa_send_interactive_buttons(
         client,
@@ -510,15 +529,16 @@ async def send_llm_menu(
         headers,
         wa_from,
         "Escolha o modelo que vai responder:",
-        [("llm_gemini", "Gemini"), ("llm_gpt", "ChatGPT"), ("llm_deepseek", "DeepSeek")],
+        [
+            ("llm_gemini", "Gemini"),
+            ("llm_gpt", "ChatGPT"),
+            ("llm_deepseek", "DeepSeek"),
+        ],
     )
 
 
 async def send_mode_menu(
-    client: httpx.AsyncClient,
-    api_url: str,
-    headers: dict[str, str],
-    wa_from: str
+    client: httpx.AsyncClient, api_url: str, headers: dict[str, str], wa_from: str
 ) -> None:
     await wa_send_interactive_buttons(
         client,
@@ -533,6 +553,7 @@ async def send_mode_menu(
 # ============================================================
 # Helpers de parse do payload
 # ============================================================
+
 
 def extract_value(payload: dict[str, Any]) -> dict[str, Any]:
     entry = (payload.get("entry") or [{}])[0]
@@ -558,6 +579,45 @@ def extract_button_id(msg: dict[str, Any]) -> tuple[Optional[str], Optional[str]
 
 
 # ============================================================
+# Helpers de UI (labels / prompt "ready")
+# ============================================================
+
+def llm_label(llm_key: str) -> str:
+    return {
+        "gemini": "Gemini",
+        "gpt": "ChatGPT",
+        "deepseek": "DeepSeek",
+    }.get((llm_key or "").strip().lower(), "—")
+
+
+def mode_label(mode_key: str) -> str:
+    mode_key = (mode_key or "").strip().lower()
+    if mode_key == "normal":
+        return "Normal"
+    if mode_key == "rag":
+        return "RAG (em breve)"
+    if mode_key == "finetune":
+        return "Fine-tuning (em breve)"
+    return "—"
+
+
+async def send_ready_prompt(
+    client: httpx.AsyncClient,
+    api_url: str,
+    headers: dict[str, str],
+    wa_from: str
+) -> None:
+    st = get_state(wa_from)
+    llm_show = llm_label(st.get("llm"))
+    mode_show = mode_label(st.get("mode"))
+    await wa_send_interactive_buttons(
+        client, api_url, headers, wa_from,
+        f"Fechado.\nLLM: {llm_show}\nModo: {mode_show}\n\nAgora envie sua pergunta.",
+        [("menu_reset", "Alterar modelo"), ("menu_keep", "Manter escolhas"), ("menu_help", "Ajuda")],
+    )
+
+
+# ============================================================
 # Interativos (botões)
 # ============================================================
 
@@ -566,69 +626,74 @@ async def handle_interactive(
     api_url: str,
     headers: dict[str, str],
     wa_from: str,
+    wamid: Optional[str],
     msg: dict[str, Any],
 ) -> dict[str, Any]:
     button_id, button_title = extract_button_id(msg)
     log("wa_button_click", wa_from=wa_from, id=button_id, title=button_title)
 
-    if not button_id:
-        await wa_send_interactive_buttons(
-            client, api_url, headers, wa_from,
-            "Não entendi tua seleção. Vamos de novo.",
-            [("menu_reset", "Reset"), ("menu_help", "Ajuda"), ("menu_keep", "Manter")],
-        )
-        return {"status": "ok_no_button_id"}
+    # Feedback visual (best effort) também para clique em botão
+    if wamid:
+        await wa_mark_read(client, api_url, headers, wamid)
+    await wa_typing(client, api_url, headers, wa_from, "typing")
 
-    if button_id in ("llm_gemini", "llm_gpt", "llm_deepseek"):
-        llm = {"llm_gemini": "gemini", "llm_gpt": "gpt", "llm_deepseek": "deepseek"}[button_id]
-        set_state(wa_from, stage="choose_mode", llm=llm)
-        await send_mode_menu(client, api_url, headers, wa_from)
-        return {"status": "ok_llm_selected"}
+    try:
+        if not button_id:
+            await wa_send_interactive_buttons(
+                client, api_url, headers, wa_from,
+                "Não entendi tua seleção. Vamos de novo.",
+                [("menu_reset", "Reset"), ("menu_help", "Ajuda"), ("menu_keep", "Manter")],
+            )
+            return {"status": "ok_no_button_id"}
 
-    if button_id in ("mode_normal", "mode_rag", "mode_ft"):
-        mode = {"mode_normal": "normal", "mode_rag": "rag", "mode_ft": "finetune"}[button_id]
+        if button_id in ("llm_gemini", "llm_gpt", "llm_deepseek"):
+            llm = {"llm_gemini": "gemini", "llm_gpt": "gpt", "llm_deepseek": "deepseek"}[button_id]
+            set_state(wa_from, stage="choose_mode", llm=llm)
+            await send_mode_menu(client, api_url, headers, wa_from)
+            return {"status": "ok_llm_selected"}
 
-        st = get_state(wa_from)
-        if not st.get("llm"):
-            # Se o usuário selecionou modo sem LLM, recupera o fluxo
+        if button_id in ("mode_normal", "mode_rag", "mode_ft"):
+            mode = {"mode_normal": "normal", "mode_rag": "rag", "mode_ft": "finetune"}[button_id]
+
+            st = get_state(wa_from)
+            if not st.get("llm"):
+                # Se o usuário selecionou modo sem LLM, recupera o fluxo
+                reset_state(wa_from)
+                await send_llm_menu(client, api_url, headers, wa_from)
+                return {"status": "need_llm_first"}
+
+            # Por enquanto, o modo (normal / RAG / fine-tuning) é apenas UI.
+            set_state(wa_from, stage="ready", mode=mode)
+
+            await send_ready_prompt(client, api_url, headers, wa_from)
+            return {"status": "ok_mode_selected"}
+
+        if button_id == "menu_reset":
             reset_state(wa_from)
             await send_llm_menu(client, api_url, headers, wa_from)
-            return {"status": "need_llm_first"}
+            return {"status": "ok_reset"}
 
-        # Por enquanto, o modo (normal / RAG / fine-tuning) é apenas UI.
-        # Todos os modos roteiam para o handler normal.
-        set_state(wa_from, stage="ready", mode=mode)
+        if button_id == "menu_help":
+            await wa_send_interactive_buttons(
+                client, api_url, headers, wa_from,
+                "Fluxo:\n1) Escolher LLM\n2) Escolher modo\n3) Enviar pergunta\n\nReset para alterar opções.",
+                [("menu_reset", "Reset"), ("menu_keep", "Manter escolhas")],
+            )
+            return {"status": "ok_help"}
 
-        llm_show = (get_state(wa_from).get("llm") or "").upper()
+        if button_id == "menu_keep":
+            await send_ready_prompt(client, api_url, headers, wa_from)
+            return {"status": "ok_keep"}
+
         await wa_send_interactive_buttons(
             client, api_url, headers, wa_from,
-            f"Fechado.\nLLM: {llm_show}\nModo: {mode}\n\nAgora manda tua pergunta.",
-            [("menu_reset", "Trocar"), ("menu_keep", "Manter"), ("menu_help", "Ajuda")],
+            "Seleção inválida. Por favor, tente novamente.",
+            [("menu_reset", "Reset"), ("menu_help", "Ajuda"), ("menu_keep", "Manter escolhas")],
         )
-        return {"status": "ok_mode_selected"}
+        return {"status": "ok_unknown_button"}
 
-    if button_id == "menu_reset":
-        reset_state(wa_from)
-        await send_llm_menu(client, api_url, headers, wa_from)
-        return {"status": "ok_reset"}
-
-    if button_id == "menu_help":
-        await wa_send_interactive_buttons(
-            client, api_url, headers, wa_from,
-            "Fluxo:\n1) Escolhe o LLM\n2) Escolhe o modo\n3) Manda a pergunta\n\nReset pra trocar tudo.",
-            [("menu_reset", "Reset"), ("menu_keep", "Manter"), ("menu_help", "Ajuda")],
-        )
-        return {"status": "ok_help"}
-
-    if button_id == "menu_keep":
-        return {"status": "ok_keep"}
-
-    await wa_send_interactive_buttons(
-        client, api_url, headers, wa_from,
-        "Seleção inválida. Vamos de novo.",
-        [("menu_reset", "Reset"), ("menu_help", "Ajuda"), ("menu_keep", "Manter")],
-    )
-    return {"status": "ok_unknown_button"}
+    finally:
+        await wa_typing(client, api_url, headers, wa_from, "paused")
 
 
 # ============================================================
@@ -644,12 +709,21 @@ async def handle_text_message(
     wamid: Optional[str],
     text: str,
 ) -> dict[str, Any]:
-    # Gate: se ainda não escolheu tudo do menu, força o fluxo
+    # Gate: se ainda não escolheu tudo do menu, força o fluxo (com explicação curta)
     st = get_state(wa_from)
     if text and st.get("stage") != "ready":
         if st.get("stage") == "choose_mode" and st.get("llm"):
+            await wa_send_text(
+                client, api_url, headers, wa_from,
+                "Antes eu preciso que você escolha o modo no menu abaixo."
+            )
             await send_mode_menu(client, api_url, headers, wa_from)
             return {"status": "need_mode"}
+
+        await wa_send_text(
+            client, api_url, headers, wa_from,
+            "Antes eu preciso que você escolha o modelo no menu abaixo."
+        )
         await send_llm_menu(client, api_url, headers, wa_from)
         return {"status": "need_llm"}
 
@@ -658,40 +732,44 @@ async def handle_text_message(
         await wa_mark_read(client, api_url, headers, wamid)
     await wa_typing(client, api_url, headers, wa_from, "typing")
 
-    prefix = text[:1] if text else ""
-    user_text = text[1:].lstrip() if len(text) > 1 else text
+    try:
+        prefix = text[:1] if text else ""
+        user_text = text[1:].lstrip() if len(text) > 1 else text
 
-    reply_text: str
-    if prefix == "@":
-        reply_text = await handler_gemini(wa_from, user_text)
-    elif prefix == "$":
-        reply_text = await handler_gpt(wa_from, user_text)
-    elif prefix == "&":
-        reply_text = await handler_deepseek(wa_from, user_text)
-    else:
-        llm_key = (get_state(wa_from).get("llm") or "").strip()
-        handler = route_llm(llm_key)
-        if not handler:
-            reset_state(wa_from)
-            await send_llm_menu(client, api_url, headers, wa_from)
-            return {"status": "need_llm_again"}
-        reply_text = await handler(wa_from, user_text)
+        reply_text: str
+        if prefix == "@":
+            reply_text = await handler_gemini(wa_from, user_text)
+        elif prefix == "$":
+            reply_text = await handler_gpt(wa_from, user_text)
+        elif prefix == "&":
+            reply_text = await handler_deepseek(wa_from, user_text)
+        else:
+            llm_key = (get_state(wa_from).get("llm") or "").strip()
+            handler = route_llm(llm_key)
+            if not handler:
+                reset_state(wa_from)
+                await send_llm_menu(client, api_url, headers, wa_from)
+                return {"status": "need_llm_again"}
+            reply_text = await handler(wa_from, user_text)
 
-    if C.get("DRY_RUN"):
-        log("wa_outbound_dry_run", to=wa_from, text=reply_text[:MAX_WA_TEXT])
-        return {"status": "dry_ok"}
+        if C.get("DRY_RUN"):
+            log("wa_outbound_dry_run", to=wa_from, text=reply_text[:MAX_WA_TEXT])
+            return {"status": "dry_ok"}
 
-    reply_text = clean_reply_text(reply_text)
+        reply_text = clean_reply_text(reply_text)
 
-    # Para o typing e envia
-    await wa_typing(client, api_url, headers, wa_from, "paused")
-    resp = await wa_send_text(client, api_url, headers, wa_from, reply_text)
-    return {"status": "sent" if resp.is_success else "error", "code": resp.status_code}
+        resp = await wa_send_text(client, api_url, headers, wa_from, reply_text)
+        return {"status": "sent" if resp.is_success else "error", "code": resp.status_code}
+
+    finally:
+        # Sempre tenta pausar o typing, mesmo em early-return/erro
+        await wa_typing(client, api_url, headers, wa_from, "paused")
 
 
 # ============================================================
 # FastAPI routes
 # ============================================================
+
 
 @app.get("/webhook")
 async def verify(request: Request):
@@ -710,9 +788,13 @@ async def verify(request: Request):
 async def incoming(request: Request):
     C = cfg()
 
-    # "soft" fail: retorna ok pra evitar retries infinitos do provedor
+    # "soft" fail: retorna ok pra evitar retries infinitos
     if not C.get("PHONE_NUMBER_ID") or not C.get("WABA_TOKEN"):
-        log("cfg_missing", phone_number_id=bool(C.get("PHONE_NUMBER_ID")), token=bool(C.get("WABA_TOKEN")))
+        log(
+            "cfg_missing",
+            phone_number_id=bool(C.get("PHONE_NUMBER_ID")),
+            token=bool(C.get("WABA_TOKEN")),
+        )
         return {"status": "ok", "warning": "missing_config"}
 
     api_url = wa_api_url(C)
@@ -722,17 +804,20 @@ async def incoming(request: Request):
         raw = await request.body()
         log("wa_inbound_raw", len=len(raw))
 
-        
         try:
-            body = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
+            body = json.loads(
+                raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
+            )
         except Exception:
             body = await request.json()
 
-        log("wa_inbound_parsed", keys=list(body.keys()) if isinstance(body, dict) else "non_dict")
+        log(
+            "wa_inbound_parsed",
+            keys=list(body.keys()) if isinstance(body, dict) else "non_dict",
+        )
 
         value = extract_value(body if isinstance(body, dict) else {})
 
-        
         if not value.get("messages"):
             statuses = value.get("statuses") or []
             log("wa_inbound_status", count=len(statuses), statuses=statuses[:3])
@@ -742,8 +827,6 @@ async def incoming(request: Request):
         if not msg:
             log("wa_inbound_skip", reason="messages_empty_after_check")
             return {"status": "ok"}
-
-
 
         wa_from = msg.get("from") or ""
         wa_type = msg.get("type") or ""
@@ -773,7 +856,9 @@ async def incoming(request: Request):
                 text = extract_text(msg)
                 if not text:
                     return {"status": "ok"}
-                return await handle_text_message(client, C, api_url, headers, wa_from, wamid, text)
+                return await handle_text_message(
+                    client, C, api_url, headers, wa_from, wamid, text
+                )
 
             log("wa_inbound_skip", reason="unsupported_type", wa_type=wa_type)
             return {"status": "ok"}
