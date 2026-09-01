@@ -3,7 +3,6 @@ httpx
 mangum
 boto3
 botocore
-python-dotenv
 openai
 langchain-chroma
 langchain-openai

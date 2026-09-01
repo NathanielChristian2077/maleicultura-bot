@@ -2,11 +2,10 @@ from typing import Any
 
 import httpx
 
-from config import clean_token
+from config import MAX_WA_TEXT, clean_token
 from utils.logging import log
 
 
-WA_TEXT_HARD_LIMIT = 4096
 WA_TEXT_SAFE_CHUNK = 3500
 
 
@@ -65,7 +64,7 @@ async def wa_send_text(
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {"body": body[:WA_TEXT_HARD_LIMIT]},
+        "text": {"body": body[:MAX_WA_TEXT]},
     }
     resp = await client.post(api_url, json=payload, headers=headers)
     log(

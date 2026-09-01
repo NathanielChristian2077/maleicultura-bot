@@ -1,11 +1,10 @@
-import asyncio
 import time
 from typing import Any, Optional
 
 import boto3
 from botocore.exceptions import ClientError
 
-from config import CONV_TABLE, CONV_TOKEN_LIMIT, CONV_TTL_DAYS, GPT5_RAG_MODEL, SYSTEM_PROMPT, env
+from config import CONV_TABLE, CONV_TTL_DAYS, SYSTEM_PROMPT
 from utils.logging import log
 
 
@@ -19,12 +18,6 @@ def _ts_ms() -> int:
 def _ttl_epoch_seconds(days: int) -> int:
     # DynamoDB TTL usa epoch em segundos.
     return int(time.time()) + days * 86400
-
-
-def _approx_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return max(1, int(len(text.split()) / 0.75))
 
 
 def save_message(wa_from: str, role: str, content: str) -> None:
@@ -67,49 +60,24 @@ def fetch_messages(wa_from: str, limit: int = 50) -> list[dict[str, Any]]:
 
 
 def latest_summary(wa_from: str, limit: int = 120) -> Optional[str]:
-    hist = fetch_messages(wa_from, limit)
-    for rec in reversed(hist):
-        if rec["role"] == "system_summary":
-            return rec["content"]
+    """
+    Conversation summarization is intentionally disabled.
+
+    The production article and runtime behavior rely on a single system prompt,
+    defined in src/config.py as SYSTEM_PROMPT. Keeping summarization disabled
+    prevents an auxiliary model instruction from becoming a second prompt path.
+    """
     return None
 
 
 async def maybe_summarize_with_gpt5_rag(wa_from: str) -> None:
-    history = fetch_messages(wa_from, 120)
-    joined = "\n".join(f"{r['role']}: {r['content']}" for r in history)
-    total = _approx_tokens(joined)
+    """
+    No-op by design.
 
-    if total <= CONV_TOKEN_LIMIT:
-        return
-
-    log("token_limit_hit", wa_from=wa_from, tokens=total)
-
-    from openai import OpenAI
-
-    client = OpenAI(api_key=env("OPENAI_API_KEY"))
-    instructions = (
-        "Resuma o diálogo recebido de forma breve, preservando o contexto e as "
-        "informações importantes para as próximas respostas."
-    )
-
-    try:
-        res = await asyncio.to_thread(
-            lambda: client.responses.create(
-                model=GPT5_RAG_MODEL,
-                reasoning={"effort": "minimal"},
-                instructions=instructions,
-                input=joined,
-                max_output_tokens=500,
-            )
-        )
-        summary = getattr(res, "output_text", "") or ""
-        summary = summary.strip()
-
-        if summary:
-            save_message(wa_from, "system_summary", summary[:2000])
-            log("summary_created", wa_from=wa_from, length=len(summary))
-    except Exception as e:
-        log("summary_exception", wa_from=wa_from, error=str(e))
+    Do not add model instructions here. The only system prompt used by the bot
+    must remain SYSTEM_PROMPT from src/config.py.
+    """
+    return None
 
 
 def build_context_block(
@@ -117,5 +85,4 @@ def build_context_block(
     max_history: int = 20,
 ) -> tuple[str, list[dict[str, Any]], Optional[str]]:
     history = fetch_messages(wa_from, max_history)
-    summary = latest_summary(wa_from)
-    return SYSTEM_PROMPT, history, summary
+    return SYSTEM_PROMPT, history, None

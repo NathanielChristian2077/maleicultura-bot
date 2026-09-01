@@ -9,13 +9,6 @@ Contexto recuperado do banco vetorial:
 
 Pergunta do produtor:
 {question}
-
-Instruções para responder:
-- Use o contexto recuperado como fonte principal da resposta.
-- Se o contexto estiver vazio ou insuficiente, diga claramente que não encontrou informação suficiente na base documental para responder com segurança.
-- Não invente fontes, números, recomendações técnicas ou nomes de produtos.
-- Responda em português do Brasil, de forma clara, objetiva e prática.
-- Use um único parágrafo e não use markdown.
 """.strip()
 
 
@@ -36,7 +29,8 @@ def format_documents(docs: Sequence[Any]) -> str:
 
         metadata = getattr(doc, "metadata", {}) or {}
         fonte = _metadata_value(metadata, "fonte") or _metadata_value(
-            metadata, "doc_id"
+            metadata,
+            "doc_id",
         )
         pagina = _metadata_value(metadata, "pagina")
         titulo = _metadata_value(metadata, "titulo")
