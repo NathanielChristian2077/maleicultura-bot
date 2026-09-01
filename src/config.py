@@ -13,14 +13,10 @@ Dê dicas objetivas baseadas em boas práticas agrícolas e experiências reais 
 
 
 # ============================================================
-# WhatsApp limits / UI
+# WhatsApp limits
 # ============================================================
 
 MAX_WA_TEXT = 4096
-
-MENU_TITLE_MAX = 20
-MENU_ID_MAX = 256
-MENU_BODY_MAX = 1024
 
 
 # ============================================================
@@ -36,7 +32,6 @@ GPT5_RAG_MODEL = os.getenv("GPT5_RAG_MODEL", "gpt-5-2025-08-07")
 # ============================================================
 
 DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "600"))
-STATE_TTL_SEC = int(os.getenv("STATE_TTL_SEC", "1800"))
 
 
 # ============================================================
