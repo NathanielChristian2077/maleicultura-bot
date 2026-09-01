@@ -148,11 +148,9 @@ async def incoming(request: Request):
             import openai
             from langchain import memorys
             from langchain.chains import ConversationChain
-            # Apenas para teste, a API oficial será usada posteriormente para produção
             client = openai.OpenAI(
-                base_url="https://api.llm7.io/v1/chat/completions",
-                api_key="V9aON2wRd+sr0kjbRRp+ZsxIEkZ0VIs4rFUcuWg+YqCtgaMFQ4UFExXFdPTn/Jxj4+BWxjWurv3I9mxWflu7430gGIFfhVnUYvD2hFKPNEbf/ZKj8Ujqw68soVakuAP4ImZdz6ZPww==",
-                http_client=httpx.Client(verify=False)
+                api_key=os.environ.get('DEEPSEEK_API_KEY'),
+                base_url="https://api.deepseek.com"
             )
             response = client.chat.completions.create(
                 model="deepseek-v3.1",
