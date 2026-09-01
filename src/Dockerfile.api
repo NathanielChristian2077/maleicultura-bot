@@ -1,0 +1,15 @@
+FROM public.ecr.aws/lambda/python:3.12
+
+WORKDIR ${LAMBDA_TASK_ROOT}
+
+COPY requirements-api.txt .
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements-api.txt
+
+COPY app.py config.py ./
+COPY routes ./routes
+COPY services/state.py services/worker_dispatch.py ./services/
+COPY utils/logging.py ./utils/
+COPY whatsapp/parser.py ./whatsapp/
+
+CMD ["app.handler"]
