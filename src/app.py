@@ -1,8 +1,11 @@
 import os
 import httpx
+from typing import Dict
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, Response
 from mangum import Mangum
+
+from memory_manager import MemoryManager
 
 import boto3
 from botocore.config import Config
@@ -16,6 +19,8 @@ _lambda = boto3.client("lambda", config=Config(retries={"max_attempts": 2}))
 # Parece que ainda existem situações onde acontece de uma mensagem receber mais de uma resposta do llm, mais frequente com o gemini (não consegui pensar num motivo) 
 _seen_wamids: dict[str, float] = {} 
 _DEDUP_TTL_SEC = 600
+
+memory_manager = MemoryManager()
 
 def seen_bfr(wamid: str):
     now = time.time()
@@ -115,7 +120,8 @@ async def incoming(request: Request):
         #   No README.md eu detalho melhor como fazer o deploy, é fácil, mas o ideal é fazer os comandos pelo Linux (ou wsl), na verdade eu não tenho ideia de como funciona direto no Windows.
         
         # prefixo: @
-        async def dev_handler1(user_text:str, wa_from: str) -> str:
+        async def dev_handler1(user_text:str, user_number:str, wa_from: str) -> str:
+            from langchain.runnables.history import RunnableWithMessageHistory
             from langchain_google_genai import ChatGoogleGenerativeAI
             from langchain.prompts import ChatPromptTemplate
 
@@ -144,7 +150,23 @@ async def incoming(request: Request):
 
             chain = prompt | llm
 
-            response = await asyncio.to_thread(chain.invoke, {"user":user_text})
+            # Inicializa a Chain com o histórico
+            chain_with_history = RunnableWithMessageHistory(
+                chain,
+                lambda session_id: memory_manager.get_memory(session_id).chat_memory,
+                input_messages_key="user",
+                history_messages_key="history",
+            )
+
+            config = {"configurable": {"session_id": user_number}}
+
+            response = await asyncio.to_thread(
+                chain_with_history.invoke(
+                    {"question": user_text},
+                    config=config
+                )
+            )
+
 
             try:
                 return response['text']
