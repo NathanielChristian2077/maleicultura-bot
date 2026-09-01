@@ -15,6 +15,7 @@ Regras para esta resposta:
 - Não invente números, produtos, doses ou recomendações que não estejam sustentados pelo contexto.
 - Se o contexto for insuficiente para responder com segurança, diga isso de forma curta e direta.
 - Responda somente ao que foi perguntado.
+- Ao usar uma informação de um trecho, cite o identificador correspondente, como [1] ou [2].
 """.strip()
 
 
@@ -38,7 +39,7 @@ def format_documents(docs: Sequence[Any]) -> str:
         pagina = _metadata_value(metadata, "pagina")
         titulo = _metadata_value(metadata, "titulo")
 
-        meta_parts = [f"trecho {index}"]
+        meta_parts = [f"fonte_id: [{index}]"]
         if fonte:
             meta_parts.append(f"fonte: {fonte}")
         if pagina:
