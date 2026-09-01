@@ -97,4 +97,33 @@ Resources:
                 - !GetAtt ConversationsTable.Arn
 
   ConversationsTable:
-    Type: AWS::Serverless::SimpleTable
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: conversations
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: wa_from
+          AttributeType: S
+        - AttributeName: ts
+          AttributeType: N
+      KeySchema:
+        - AttributeName: wa_from
+          KeyType: HASH
+        - AttributeName: ts
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+Outputs:
+  ApiEndpoint:
+    Description: Endpoint HTTP público
+    Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+
+  ApiFunctionName:
+    Description: Nome físico da Lambda do webhook
+    Value: !Ref ApiFunction
+
+  WorkerFunctionName:
+    Description: Nome físico da Lambda worker assíncrona
+    Value: !Ref WorkerFunction
