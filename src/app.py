@@ -8,9 +8,30 @@ import boto3
 from botocore.config import Config
 import asyncio
 import re
+import time
 
 app = FastAPI()
 _lambda = boto3.client("lambda", config=Config(retries={"max_attempts": 2}))
+
+# Parece que ainda existem situações onde acontece de uma mensagem receber mais de uma resposta do llm, mais frequente com o gemini (não consegui pensar num motivo) 
+_seen_wamids: dict[str, float] = {} 
+_DEDUP_TTL_SEC = 600
+
+def seen_bfr(wamid: str):
+    now = time.time()
+    expired = [
+        k for k, ts in _seen_wamids.items() 
+            if now - ts > _DEDUP_TTL_SEC
+    ]
+
+    for k in expired:
+        _seen_wamids.pop(k, None)
+    if not wamid:
+        return False
+    if wamid in _seen_wamids:
+        return True
+    _seen_wamids[wamid] = now
+    return False
 
 def env(name: str, default: str = "") -> str:
     fallback_map = {
@@ -78,6 +99,11 @@ async def incoming(request: Request):
         if is_echo:
             print({"type":"wa_inbound_skip", "reason":"echo"})
             return {"status": "ok"}
+        
+        wamid = msg.get("id") or msg.get("wamid")
+        if seen_bfr(wamid):
+            print({"type":"wa_inbound_skip", "reason":"duplicate_wamid", "wamid": wamid})
+            return {"status":"ok"}
 
         print({"type":"wa_inbound_message", "from": wa_from, "msg_type": wa_type})
         
@@ -128,7 +154,8 @@ async def incoming(request: Request):
         # prefixo: $
         async def dev_handler2(user_text:str, wa_from: str) -> str:
             import openai
-            
+
+            # Tive que dar uma alterada em como estava setado o gpt-5, estavam vindo muitos erros da api, aparentemente por ser com o uso do gpt-5 algumas coisas mudam, na prática não mudou nada
             client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
             try:
                 response = await asyncio.to_thread(
@@ -197,6 +224,8 @@ async def incoming(request: Request):
         url = f"https://graph.facebook.com/{C['GRAPH_VERSION']}/{C['PHONE_NUMBER_ID']}/messages"
 
         reply_text = (reply_text or "Parece que algo deu errado, tente novamente por gentileza.")
+        # O Fabricio relatou que tiveram casos onde as respostas dos llms estavam chagando com markdown, então fiz isso aqui pra limpar.
+        # Não tenho certeza, mas acho que dá pra setar algum parâmetro em pra resposta vir como "plaintext", se encontrarem, adicionem pros merges futuros e me avisem
         reply_text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", reply_text)
         reply_text = re.sub(r"[`*_~#>]", "", reply_text)
         reply_text = reply_text.strip()
