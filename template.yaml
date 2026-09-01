@@ -30,7 +30,7 @@ Resources:
   ApiFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      Dockerfile: Dockerfile
+      Dockerfile: Dockerfile.api
       DockerContext: src/
       DockerTag: gpt5-rag-api
     Properties:
@@ -53,6 +53,7 @@ Resources:
                 - dynamodb:DeleteItem
                 - dynamodb:Scan
                 - dynamodb:UpdateItem
+                - dynamodb:BatchWriteItem
               Resource:
                 - !GetAtt ConversationsTable.Arn
             - Effect: Allow
@@ -70,7 +71,7 @@ Resources:
   WorkerFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      Dockerfile: Dockerfile
+      Dockerfile: Dockerfile.worker
       DockerContext: src/
       DockerTag: gpt5-rag-worker
     Properties:
@@ -93,6 +94,7 @@ Resources:
                 - dynamodb:DeleteItem
                 - dynamodb:Scan
                 - dynamodb:UpdateItem
+                - dynamodb:BatchWriteItem
               Resource:
                 - !GetAtt ConversationsTable.Arn
 
