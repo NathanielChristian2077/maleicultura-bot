@@ -1,0 +1,38 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "fake-entry",
+      "changes": [
+        {
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "5500000000000",
+              "phone_number_id": "fake-phone-id"
+            },
+            "contacts": [
+              {
+                "profile": {
+                  "name": "Smoke Test"
+                },
+                "wa_id": "5599999999999"
+              }
+            ],
+            "messages": [
+              {
+                "from": "5599999999999",
+                "timestamp": "1783628494",
+                "type": "text",
+                "text": {
+                  "body": "Quais são os riscos da patulina em maçãs?"
+                }
+              }
+            ]
+          },
+          "field": "messages"
+        }
+      ]
+    }
+  ]
+}
