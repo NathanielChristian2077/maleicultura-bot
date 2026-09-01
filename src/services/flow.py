@@ -9,6 +9,7 @@ from services.llm import route_llm, handler_gemini, handler_gpt, handler_deepsee
 from whatsapp.parser import extract_button_id
 from whatsapp.sender import (
     wa_send_text,
+    wa_send_text_chunks,
     wa_send_interactive_buttons,
     wa_typing_and_read,
     send_llm_menu,
@@ -25,11 +26,11 @@ async def handle_interactive(
     wamid: Optional[str],
     msg: dict[str, Any],
 ) -> dict[str, Any]:
-    button_id, button_title = extract_button_id(msg)
-    log("wa_button_click", wa_from=wa_from, id=button_id, title=button_title)
-
     if wamid:
         await wa_typing_and_read(client, api_url, headers, wamid)
+
+    button_id, button_title = extract_button_id(msg)
+    log("wa_button_click", wa_from=wa_from, id=button_id, title=button_title)
 
     if not button_id:
         await wa_send_interactive_buttons(
@@ -137,6 +138,9 @@ async def handle_text_message(
     wamid: Optional[str],
     text: str,
 ) -> dict[str, Any]:
+    if wamid:
+        await wa_typing_and_read(client, api_url, headers, wamid)
+
     st = get_state(wa_from)
 
     # Gate: força o usuário a concluir o fluxo antes de perguntar
@@ -190,9 +194,11 @@ async def handle_text_message(
         return {"status": "dry_ok"}
 
     reply_text = clean_reply_text(reply_text)
+    responses = await wa_send_text_chunks(client, api_url, headers, wa_from, reply_text)
 
-    resp = await wa_send_text(client, api_url, headers, wa_from, reply_text)
+    ok = all(r.is_success for r in responses)
     return {
-        "status": "sent" if resp.is_success else "error",
-        "code": resp.status_code,
+        "status": "sent" if ok else "error",
+        "chunks": len(responses),
+        "code": responses[-1].status_code if responses else 500,
     }

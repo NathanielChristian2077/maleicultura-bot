@@ -5,7 +5,7 @@ Description: Maleicultura - FastAPI on Lambda + HTTP API
 Globals:
   Function:
     Runtime: python3.12
-    Timeout: 30
+    Timeout: 60
     MemorySize: 512
     Architectures:
       - x86_64

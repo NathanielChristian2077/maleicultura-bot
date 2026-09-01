@@ -1,4 +1,6 @@
 import asyncio
+import time
+import traceback
 from typing import Any
 
 from config import env
@@ -10,16 +12,64 @@ from services.memory import (
 )
 
 
+async def _finalize_reply(
+    model: str,
+    wa_from: str,
+    user_text: str,
+    reply: str,
+    started_at: float,
+) -> str:
+    latency = time.perf_counter() - started_at
+
+    log(
+        "llm_latency",
+        model=model,
+        wa_from=wa_from,
+        seconds=round(latency, 3),
+        input_chars=len(user_text or ""),
+        output_chars=len(reply or ""),
+    )
+
+    save_message(wa_from, "user", user_text)
+    save_message(wa_from, "assistant", reply)
+    await maybe_summarize_with_gemini(wa_from)
+
+    return (reply or "").strip()
+
+
+def _log_llm_exception(
+    model: str,
+    wa_from: str,
+    user_text: str,
+    started_at: float,
+    exc: Exception,
+) -> None:
+    latency = time.perf_counter() - started_at
+
+    log(
+        "llm_exception",
+        model=model,
+        wa_from=wa_from,
+        seconds=round(latency, 3),
+        input_chars=len(user_text or ""),
+        error_type=type(exc).__name__,
+        error=str(exc),
+        traceback=traceback.format_exc(),
+    )
+
+
 async def handler_gemini(wa_from: str, user_text: str) -> str:
     from langchain_google_genai import ChatGoogleGenerativeAI
     from langchain.schema import SystemMessage, HumanMessage, AIMessage
+
+    started_at = time.perf_counter()
 
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash",
         google_api_key=env("GEMINI_API_KEY"),
         convert_system_message_to_human=True,
         temperature=0.3,
-        max_output_tokens=300,
+        max_output_tokens=500,
     )
 
     system, history, summary = build_context_block(wa_from, max_history=30)
@@ -39,24 +89,25 @@ async def handler_gemini(wa_from: str, user_text: str) -> str:
     try:
         res = await asyncio.to_thread(llm.invoke, msgs)
         reply = getattr(res, "content", None) or str(res)
+
+        if not reply or not str(reply).strip():
+            reply = "Desculpe, o modelo não retornou conteúdo."
+
+        return await _finalize_reply("gemini", wa_from, user_text, reply, started_at)
+
     except Exception as e:
-        log("gemini_exception", wa_from=wa_from, error=str(e))
+        _log_llm_exception("gemini", wa_from, user_text, started_at, e)
         reply = "Desculpe, ocorreu um erro."
-
-    save_message(wa_from, "user", user_text)
-    save_message(wa_from, "assistant", reply)
-    await maybe_summarize_with_gemini(wa_from)
-
-    return (reply or "").strip()
+        return await _finalize_reply("gemini", wa_from, user_text, reply, started_at)
 
 
 async def handler_gpt(wa_from: str, user_text: str) -> str:
     import openai
-    import asyncio
 
+    started_at = time.perf_counter()
     client = openai.OpenAI(api_key=env("OPENAI_API_KEY"))
 
-    system, history, summary = build_context_block(wa_from, max_history=20)
+    system, history, summary = build_context_block(wa_from, max_history=30)
 
     context = system + "\n"
     if summary:
@@ -74,34 +125,38 @@ async def handler_gpt(wa_from: str, user_text: str) -> str:
                 reasoning={"effort": "minimal"},
                 instructions=context,
                 input=user_text,
+                max_output_tokens=500,
             )
         )
         reply = getattr(res, "output_text", "") or "Erro."
+
+        if not reply or not str(reply).strip():
+            reply = "Desculpe, o modelo não retornou conteúdo."
+
+        return await _finalize_reply("gpt", wa_from, user_text, reply, started_at)
+
     except Exception as e:
-        log("openai_exception", wa_from=wa_from, error=str(e))
+        _log_llm_exception("gpt", wa_from, user_text, started_at, e)
         reply = "Desculpe, ocorreu um erro ao processar sua solicitação."
-
-    save_message(wa_from, "user", user_text)
-    save_message(wa_from, "assistant", reply)
-    await maybe_summarize_with_gemini(wa_from)
-
-    return (reply or "").strip()
+        return await _finalize_reply("gpt", wa_from, user_text, reply, started_at)
 
 
 async def handler_deepseek(wa_from: str, user_text: str) -> str:
-    import asyncio
     from langchain_openai import ChatOpenAI
     from langchain.schema import SystemMessage, HumanMessage, AIMessage
 
+    started_at = time.perf_counter()
+
     client = ChatOpenAI(
         api_key=env("DEEPSEEK_API_KEY"),
-        base_url="https://api.deepseek.com",
+        base_url="https://api.deepseek.com/v1",
         model="deepseek-chat",
         temperature=0.3,
-        max_tokens=300,
+        max_tokens=500,
+        timeout=45,
     )
 
-    system, history, summary = build_context_block(wa_from, max_history=20)
+    system, history, summary = build_context_block(wa_from, max_history=30)
 
     msgs: list[Any] = [SystemMessage(content=system)]
     if summary:
@@ -118,15 +173,16 @@ async def handler_deepseek(wa_from: str, user_text: str) -> str:
     try:
         res = await asyncio.to_thread(client.invoke, msgs)
         reply = getattr(res, "content", "") or str(res)
+
+        if not reply or not str(reply).strip():
+            reply = "Desculpe, o modelo não retornou conteúdo."
+
+        return await _finalize_reply("deepseek", wa_from, user_text, reply, started_at)
+
     except Exception as e:
-        log("deepseek_exception", wa_from=wa_from, error=str(e))
+        _log_llm_exception("deepseek", wa_from, user_text, started_at, e)
         reply = "Desculpe, ocorreu um erro ao processar sua solicitação."
-
-    save_message(wa_from, "user", user_text)
-    save_message(wa_from, "assistant", reply)
-    await maybe_summarize_with_gemini(wa_from)
-
-    return (reply or "").strip()
+        return await _finalize_reply("deepseek", wa_from, user_text, reply, started_at)
 
 
 def route_llm(llm_key: str):
