@@ -4,9 +4,10 @@ import traceback
 from typing import Any
 
 from config import GPT5_FAST_MODEL, GPT5_RAG_MODEL, SYSTEM_PROMPT, env
+from rag.citations import append_sources
 from rag.prompt import build_rag_input
 from rag.store import retrieve_documents
-from services.memory import build_context_block, save_message
+from services.memory import build_context_block
 from services.router import RouteDecision, build_retrieval_query, route_message
 from utils.logging import log
 
@@ -22,7 +23,7 @@ def _openai_client() -> Any:
     return _client
 
 
-async def _finalize_reply(
+def _finalize_reply(
     wa_from: str,
     user_text: str,
     reply: str,
@@ -40,9 +41,6 @@ async def _finalize_reply(
         input_chars=len(user_text or ""),
         output_chars=len(reply or ""),
     )
-
-    await asyncio.to_thread(save_message, wa_from, "user", user_text)
-    await asyncio.to_thread(save_message, wa_from, "assistant", reply)
     return (reply or "").strip()
 
 
@@ -98,9 +96,13 @@ async def _context_for_route(
     return _format_instruction_context(system, history), history
 
 
-async def handler_gpt5_rag(wa_from: str, user_text: str) -> str:
+async def handler_gpt5_rag(
+    wa_from: str,
+    user_text: str,
+    decision: RouteDecision | None = None,
+) -> str:
     started_at = time.perf_counter()
-    decision = route_message(user_text)
+    decision = decision or route_message(user_text)
     log(
         "message_routed",
         wa_from=wa_from,
@@ -132,7 +134,7 @@ async def handler_gpt5_rag(wa_from: str, user_text: str) -> str:
                 "Não encontrei informação suficiente na base documental para "
                 "responder com segurança a essa pergunta."
             )
-            return await _finalize_reply(
+            return _finalize_reply(
                 wa_from,
                 user_text,
                 reply,
@@ -163,8 +165,10 @@ async def handler_gpt5_rag(wa_from: str, user_text: str) -> str:
         reply = getattr(res, "output_text", "") or ""
         if not reply.strip():
             reply = "Desculpe, o modelo não retornou conteúdo."
+        else:
+            reply = append_sources(reply, docs)
 
-        return await _finalize_reply(
+        return _finalize_reply(
             wa_from,
             user_text,
             reply,
@@ -182,7 +186,7 @@ async def handler_gpt5_rag(wa_from: str, user_text: str) -> str:
             route_kind=decision.kind,
         )
         reply = "Desculpe, ocorreu um erro ao processar sua solicitação."
-        return await _finalize_reply(
+        return _finalize_reply(
             wa_from,
             user_text,
             reply,
