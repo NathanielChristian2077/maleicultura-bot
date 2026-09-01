@@ -14,10 +14,14 @@ Globals:
         WHATSAPP_PHONE_NUMBER_ID: '{{resolve:ssm:/maleicultura/phone_number_id}}'
         OPENAI_API_KEY: '{{resolve:ssm:/maleicultura/openai_api_key}}'
         GPT5_RAG_MODEL: gpt-5-2025-08-07
+        GPT5_FAST_MODEL: gpt-5-mini-2025-08-07
         RAG_EMBED_MODEL: text-embedding-3-small
         RAG_CHROMA_COLLECTION: chunks
         RAG_CHROMA_PATH: chroma_db
         RAG_TOP_K: "3"
+        RAG_DENSE_K: "12"
+        RAG_LEXICAL_K: "12"
+        RAG_MIN_RELEVANCE: "0.18"
         CONV_TABLE: conversations
         CONV_TTL_DAYS: "7"
         DEDUP_TTL_SEC: "600"
@@ -93,33 +97,4 @@ Resources:
                 - !GetAtt ConversationsTable.Arn
 
   ConversationsTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: conversations
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: wa_from
-          AttributeType: S
-        - AttributeName: ts
-          AttributeType: N
-      KeySchema:
-        - AttributeName: wa_from
-          KeyType: HASH
-        - AttributeName: ts
-          KeyType: RANGE
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
-
-Outputs:
-  ApiEndpoint:
-    Description: Endpoint HTTP público
-    Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com
-
-  ApiFunctionName:
-    Description: Nome físico da Lambda do webhook
-    Value: !Ref ApiFunction
-
-  WorkerFunctionName:
-    Description: Nome físico da Lambda worker assíncrona
-    Value: !Ref WorkerFunction
+    Type: AWS::Serverless::SimpleTable
