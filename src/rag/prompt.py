@@ -4,11 +4,17 @@ from typing import Any
 NO_CONTEXT_MESSAGE = "Nenhum contexto encontrado no banco vetorial."
 
 RAG_USER_TEMPLATE = """
-Contexto recuperado do banco vetorial:
+Contexto recuperado do banco documental:
 {context}
 
 Pergunta do produtor:
 {question}
+
+Regras para esta resposta:
+- Use o contexto recuperado como base da orientação técnica.
+- Não invente números, produtos, doses ou recomendações que não estejam sustentados pelo contexto.
+- Se o contexto for insuficiente para responder com segurança, diga isso de forma curta e direta.
+- Responda somente ao que foi perguntado.
 """.strip()
 
 
@@ -28,10 +34,7 @@ def format_documents(docs: Sequence[Any]) -> str:
             continue
 
         metadata = getattr(doc, "metadata", {}) or {}
-        fonte = _metadata_value(metadata, "fonte") or _metadata_value(
-            metadata,
-            "doc_id",
-        )
+        fonte = _metadata_value(metadata, "fonte") or _metadata_value(metadata, "doc_id")
         pagina = _metadata_value(metadata, "pagina")
         titulo = _metadata_value(metadata, "titulo")
 
