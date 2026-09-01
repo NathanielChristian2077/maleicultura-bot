@@ -1,0 +1,6 @@
+httpx
+boto3
+botocore
+openai
+langchain-chroma
+langchain-openai
