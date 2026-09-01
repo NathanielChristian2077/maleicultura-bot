@@ -93,8 +93,24 @@ async def incoming(request: Request):
     
         # prefixo: $
         async def dev_handler2(user_text:str, wa_from: str, C: dict) -> str:
-            #TODO: Integrar LLM (Bruno)
-            return f"{user_text}"
+            import openai
+            # Conferir e setar a chave da API depois
+            client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-5",
+                    messages=[
+                        {"role": "system", "content": "Você é um assistente de maleicultores brasileiros extremamente prestativo e objetivo que fala apenas em português."},
+                        {"role": "user", "content": user_text}
+                    ],
+                    temperature=0.3,
+                    max_tokens=300, 
+                )
+                assistant_message = response.choices[0].message.content
+                return assistant_message.strip() if assistant_message is not None else "Desculpe, ocorreu um erro ao processar sua solicitação."
+            except Exception as e:
+                print({"type":"openai_exception", "error": str(e)})
+                return "Desculpe, ocorreu um erro ao processar sua solicitação."
     
         # prefixo: &
         async def dev_handler3(user_text:str, wa_from: str, C: dict) -> str:
