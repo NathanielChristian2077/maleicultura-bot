@@ -167,7 +167,6 @@ async def incoming(request: Request):
                 )
             )
 
-
             try:
                 return response['text']
             except Exception:
@@ -226,6 +225,7 @@ async def incoming(request: Request):
         user_text = text[1:].lstrip() if len(text) > 1 else ""
         match prefix:
             case "@":
+                # Adicionar o numero do usuario como parametro para funcionar
                 reply_text = await dev_handler1(user_text=user_text, wa_from=wa_from)
             case "$":
                 reply_text = await dev_handler2(user_text=user_text, wa_from=wa_from)
